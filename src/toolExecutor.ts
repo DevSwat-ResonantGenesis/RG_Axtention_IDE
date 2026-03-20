@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as cp from 'child_process';
 import * as path from 'path';
+import * as fs from 'fs';
 import * as https from 'https';
 import * as http from 'http';
 import * as interactiveTerminal from './interactiveTerminal';
@@ -161,12 +162,11 @@ const IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp', 's
 async function execFileRead(filePath: string, offset?: number, limit?: number): Promise<string> {
   try {
     const ext = path.extname(filePath).replace('.', '').toLowerCase();
-    const uri = vscode.Uri.file(filePath);
 
     // Image file support — return base64 + metadata
     if (IMAGE_EXTENSIONS.has(ext)) {
-      const data = await vscode.workspace.fs.readFile(uri);
-      const base64 = Buffer.from(data).toString('base64');
+      const data = fs.readFileSync(filePath);
+      const base64 = data.toString('base64');
       const sizeKB = (data.byteLength / 1024).toFixed(1);
       return JSON.stringify({
         path: filePath,
@@ -178,8 +178,7 @@ async function execFileRead(filePath: string, offset?: number, limit?: number): 
       });
     }
 
-    const data = await vscode.workspace.fs.readFile(uri);
-    let content = Buffer.from(data).toString('utf-8');
+    let content = fs.readFileSync(filePath, 'utf-8');
     if (offset || limit) {
       const lines = content.split('\n');
       const start = (offset || 1) - 1;
@@ -197,41 +196,46 @@ async function execFileRead(filePath: string, offset?: number, limit?: number): 
 async function execFileWrite(filePath: string, content: string): Promise<string> {
   try {
     if (content === undefined || content === null) {
+      console.error('[Resonant Tool] file_write: content is missing/undefined for', filePath);
       return JSON.stringify({ error: 'file_write requires "content" argument. The content to write was missing or undefined.' });
     }
     const text = typeof content === 'string' ? content : String(content);
-    const uri = vscode.Uri.file(filePath);
-    // Create parent dirs
-    const dir = vscode.Uri.file(path.dirname(filePath));
-    try { await vscode.workspace.fs.createDirectory(dir); } catch { /* exists */ }
-    await vscode.workspace.fs.writeFile(uri, Buffer.from(text, 'utf-8'));
+    console.log(`[Resonant Tool] file_write: writing ${text.length} bytes to ${filePath}`);
+    // Use Node.js fs directly — more reliable than vscode.workspace.fs in dev builds
+    const dir = path.dirname(filePath);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(filePath, text, 'utf-8');
+    // Verify write succeeded
+    const stat = fs.statSync(filePath);
+    console.log(`[Resonant Tool] file_write: verified ${stat.size} bytes on disk at ${filePath}`);
     return JSON.stringify({ path: filePath, written: true, bytes: text.length });
   } catch (e: any) {
+    console.error('[Resonant Tool] file_write FAILED:', e.message, 'path:', filePath);
     return JSON.stringify({ error: e.message });
   }
 }
 
 async function execFileEdit(filePath: string, oldStr: string, newStr: string, replaceAll?: boolean, explanation?: string): Promise<string> {
   try {
-    const uri = vscode.Uri.file(filePath);
-    const data = await vscode.workspace.fs.readFile(uri);
-    const content = Buffer.from(data).toString('utf-8');
+    console.log(`[Resonant Tool] file_edit: ${filePath}`);
+    const content = fs.readFileSync(filePath, 'utf-8');
     if (!content.includes(oldStr)) {
       return JSON.stringify({ error: 'old_string not found in file' });
     }
     const newContent = replaceAll ? content.split(oldStr).join(newStr) : content.replace(oldStr, newStr);
-    await vscode.workspace.fs.writeFile(uri, Buffer.from(newContent, 'utf-8'));
+    fs.writeFileSync(filePath, newContent, 'utf-8');
+    console.log(`[Resonant Tool] file_edit: written ${newContent.length} bytes to ${filePath}`);
     return JSON.stringify({ path: filePath, edited: true, ...(explanation ? { explanation } : {}) });
   } catch (e: any) {
+    console.error('[Resonant Tool] file_edit FAILED:', e.message);
     return JSON.stringify({ error: e.message });
   }
 }
 
 async function execMultiEdit(filePath: string, edits: { old_string: string; new_string: string; replace_all?: boolean }[], explanation?: string): Promise<string> {
   try {
-    const uri = vscode.Uri.file(filePath);
-    const data = await vscode.workspace.fs.readFile(uri);
-    let content = Buffer.from(data).toString('utf-8');
+    console.log(`[Resonant Tool] multi_edit: ${filePath} (${edits.length} edits)`);
+    let content = fs.readFileSync(filePath, 'utf-8');
     const original = content;
     for (let i = 0; i < edits.length; i++) {
       if (!content.includes(edits[i].old_string)) {
@@ -242,7 +246,8 @@ async function execMultiEdit(filePath: string, edits: { old_string: string; new_
         : content.replace(edits[i].old_string, edits[i].new_string);
     }
     if (content === original) return JSON.stringify({ path: filePath, edited: false, message: 'No changes' });
-    await vscode.workspace.fs.writeFile(uri, Buffer.from(content, 'utf-8'));
+    fs.writeFileSync(filePath, content, 'utf-8');
+    console.log(`[Resonant Tool] multi_edit: written ${content.length} bytes to ${filePath}`);
     return JSON.stringify({ path: filePath, edited: true, edits_applied: edits.length, ...(explanation ? { explanation } : {}) });
   } catch (e: any) {
     return JSON.stringify({ error: e.message });
@@ -251,12 +256,11 @@ async function execMultiEdit(filePath: string, edits: { old_string: string; new_
 
 async function execFileList(dirPath: string): Promise<string> {
   try {
-    const uri = vscode.Uri.file(dirPath);
-    const entries = await vscode.workspace.fs.readDirectory(uri);
-    const items = entries.map(([name, type]) => ({
-      name,
-      isDirectory: type === vscode.FileType.Directory,
-      path: path.join(dirPath, name),
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    const items = entries.map((entry) => ({
+      name: entry.name,
+      isDirectory: entry.isDirectory(),
+      path: path.join(dirPath, entry.name),
     }));
     return JSON.stringify({ path: dirPath, items });
   } catch (e: any) {
@@ -266,8 +270,7 @@ async function execFileList(dirPath: string): Promise<string> {
 
 async function execFileDelete(filePath: string): Promise<string> {
   try {
-    const uri = vscode.Uri.file(filePath);
-    await vscode.workspace.fs.delete(uri, { recursive: true });
+    fs.rmSync(filePath, { recursive: true, force: true });
     return JSON.stringify({ path: filePath, deleted: true });
   } catch (e: any) {
     return JSON.stringify({ error: e.message });
@@ -1021,12 +1024,8 @@ async function execReadNotebook(filePath: string): Promise<string> {
 
 async function execFileMove(source: string, destination: string): Promise<string> {
   try {
-    const srcUri = vscode.Uri.file(source);
-    const dstUri = vscode.Uri.file(destination);
-    // Create parent directory
-    const dstDir = vscode.Uri.file(path.dirname(destination));
-    try { await vscode.workspace.fs.createDirectory(dstDir); } catch { /* exists */ }
-    await vscode.workspace.fs.rename(srcUri, dstUri, { overwrite: false });
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    fs.renameSync(source, destination);
     return JSON.stringify({ source, destination, moved: true });
   } catch (e: any) {
     return JSON.stringify({ error: e.message });
