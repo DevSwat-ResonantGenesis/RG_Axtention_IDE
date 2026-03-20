@@ -69,22 +69,29 @@ User's Machine (RG_IDE extension)          Server (this service)
 1. Client → `POST /api/v1/ide/agent-stream` with prompt + workspace info
 2. Server streams SSE events:
    - `thinking` — `{"message": "Thinking... (loop N)"}`
+   - `fallback` — `{"provider": "anthropic", "model": "claude-...", "attempt": 1}` (emitted each time a provider is tried)
    - `text` — `{"content": "markdown text..."}`
    - `execute_tool` — `{"session_id": "...", "tool_call_id": "...", "name": "...", "arguments": {...}}`
    - `tool_done` — `{"tool_call_id": "...", "status": "ok|error"}`
-   - `stats` — `{"loops": N, "tool_calls": N, "tokens": N, "provider": "...", "model": "..."}`
+   - `stats` — `{"loops": N, "tool_calls": N, "tokens": N, "provider": "...", "model": "...", "fallback_chain": [...]}`
    - `done` — `{}`
    - `error` — `{"error": "..."}`
 3. On `execute_tool` → client runs tool locally → `POST .../tool-results`
 4. Server resumes loop with results → calls LLM again → repeat until done
 
-## LLM Provider Chain
+## LLM Provider Chain (`rg_llm`)
 
-The server resolves LLM providers in order:
+All LLM calls go through the shared **`RG_UnifiedLLMClient`** (`rg_llm`) module — the same client used by `chat_service`, `agent_engine_service`, and `rg_agentic_chat`. This ensures consistent provider support, BYOK key resolution, and fallback behavior across the platform.
 
-1. **User's preferred provider** (from `model_id`) with BYOK key or platform key
-2. **Fallback chain**: Groq → Anthropic → OpenAI → DeepSeek → Mistral → Google
-3. **Local Ollama** (when `local_llm` is provided): server calls the client's Ollama URL directly. Falls back to cloud if unreachable.
+**Resolution order** (via `rg_llm.build_provider_chain()`):
+
+1. **User's preferred provider** (from `model_id`) — BYOK key first, then platform key
+2. **Fallback chain**: OpenAI → Anthropic → Groq → Google → DeepSeek → Mistral (each with BYOK → platform dual-key)
+3. **Local Ollama** (when `local_llm` is provided): registered as a temporary `ProviderConfig`, tried first. Falls back to cloud if unreachable.
+
+**BYOK key fetch**: `GET /api-keys/user/{user_id}` on `auth_service` — returns `decrypted_key` for each provider. Non-LLM keys (github, figma, etc.) are filtered by provider name.
+
+**Live fallback visualization**: Each provider attempt emits a `fallback` SSE event so the client can show the chain in real-time.
 
 ## 59 Tool Definitions (11 Categories)
 
@@ -136,28 +143,35 @@ Gateway routes `/api/v1/ide/*` → `ide_agent_service:8000`.
 
 ## Environment Variables
 
+API keys are read by `rg_llm` via `ProviderConfig.env_key_name` — see `rg_llm/providers.py` for the canonical list.
+
 | Variable | Description | Required |
 |----------|------------|----------|
-| `GROQ_API_KEY` | Groq API key (primary fallback) | Yes |
-| `ANTHROPIC_API_KEY` | Anthropic API key | Optional |
-| `OPENAI_API_KEY` | OpenAI API key | Optional |
-| `GOOGLE_API_KEY` | Google Gemini API key | Optional |
-| `DEEPSEEK_API_KEY` | DeepSeek API key | Optional |
-| `MISTRAL_API_KEY` | Mistral API key | Optional |
-| `AUTH_URL` | Auth service URL (for BYOK key lookup) | Default: `http://auth-service:8000` |
+| `GROQ_API_KEY` | Groq platform key (comma-separated OK) | Optional |
+| `ANTHROPIC_API_KEY` | Anthropic platform key | Optional |
+| `OPENAI_API_KEY` | OpenAI platform key | Optional |
+| `GEMINI_API_KEY` | Google Gemini platform key | Optional |
+| `DEEPSEEK_API_KEY` | DeepSeek platform key | Optional |
+| `MISTRAL_API_KEY` | Mistral platform key | Optional |
+| `AUTH_URL` | Auth service URL (for BYOK key lookup) | Default: `http://auth_service:8000` |
 | `PORT` | Service port | Default: `8000` |
+
+> **Note**: Platform keys are fallbacks. Users with BYOK keys stored in `auth_service` get their own keys tried first (dual-key resolution per provider).
 
 ## Project Structure
 
 ```
 app/
 ├── main.py              # FastAPI app, CORS, router mounting
-├── config.py            # Env vars, provider URLs, default models, fallback order
-├── llm_client.py        # Direct LLM streaming (OpenAI-compat, Anthropic, Ollama)
+├── config.py            # Service-level settings (PORT only)
+├── llm_client.py        # Thin wrapper around rg_llm.UnifiedLLMClient + BYOK fetch
 └── routers/
     ├── __init__.py
     ├── ide_agent_loop.py  # Agentic loop, tool defs, system prompt, smart selection
     └── ide_completions.py # Single-turn LLM proxy
+
+# Volume-mounted at runtime:
+/app/rg_llm/             # RG_UnifiedLLMClient — shared LLM module
 ```
 
 ## Related Repos
