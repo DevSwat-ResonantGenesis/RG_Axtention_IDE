@@ -346,7 +346,8 @@ async def agent_stream(
     - text: {"content": "markdown text..."}
     - execute_tool: {"session_id": "...", "tool_call_id": "...", "name": "...", "arguments": {...}}
     - tool_done: {"tool_call_id": "...", "status": "ok|error"}
-    - stats: {"loops": N, "tool_calls": N, "tokens": N, "provider": "...", "model": "..."}
+    - fallback: {"provider": "...", "model": "...", "attempt": N}
+    - stats: {"loops": N, "tool_calls": N, "tokens": N, "provider": "...", "model": "...", "fallback_chain": [...]}
     - done: {}
     - error: {"error": "..."}
     """
@@ -403,6 +404,7 @@ async def agent_stream(
             loops = 0
             last_provider = ""
             last_model = ""
+            fallback_chain = []
 
             while loops < max_loops:
                 loops += 1
@@ -413,6 +415,8 @@ async def agent_stream(
                 # Call LLM via direct provider calls with fallback
                 content = ""
                 tool_calls = []
+                fallback_attempt = 0
+                loop_fallback_chain = []
 
                 try:
                     async for chunk in call_llm_streaming(
@@ -430,6 +434,12 @@ async def agent_stream(
                                 content += chunk.content
                                 yield f"event: text\ndata: {json.dumps({'content': chunk.content})}\n\n"
 
+                        elif chunk.event == "fallback":
+                            fallback_attempt += 1
+                            fb_info = {'provider': chunk.provider, 'model': chunk.model, 'attempt': fallback_attempt}
+                            loop_fallback_chain.append(fb_info)
+                            yield f"event: fallback\ndata: {json.dumps(fb_info)}\n\n"
+
                         elif chunk.event == "tool_calls":
                             tool_calls = chunk.tool_calls or []
 
@@ -439,6 +449,8 @@ async def agent_stream(
                                 total_tokens += u.get("total_tokens", 0) or (u.get("prompt_tokens", 0) + u.get("completion_tokens", 0))
                             last_provider = chunk.provider or provider_key
                             last_model = chunk.model or model_name
+                            if loop_fallback_chain:
+                                fallback_chain.extend(loop_fallback_chain)
 
                         elif chunk.event == "error":
                             yield f"event: error\ndata: {json.dumps({'error': chunk.error})}\n\n"
@@ -509,7 +521,7 @@ async def agent_stream(
                     _compress_old_messages(messages)
 
             # ── Done ──
-            yield f"event: stats\ndata: {json.dumps({'loops': loops, 'tool_calls': total_tool_calls, 'tokens': total_tokens, 'provider': last_provider, 'model': last_model})}\n\n"
+            yield f"event: stats\ndata: {json.dumps({'loops': loops, 'tool_calls': total_tool_calls, 'tokens': total_tokens, 'provider': last_provider, 'model': last_model, 'fallback_chain': fallback_chain})}\n\n"
             yield f"event: done\ndata: {json.dumps({})}\n\n"
 
         except Exception as e:

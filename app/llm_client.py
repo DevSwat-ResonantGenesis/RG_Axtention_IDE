@@ -53,13 +53,17 @@ async def fetch_user_byok_keys(user_id: str, auth_token: str = "") -> Dict[str, 
             )
             if resp.status_code == 200:
                 data = resp.json()
+                logger.info(f"BYOK response type={type(data).__name__} len={len(data) if isinstance(data, (list, dict)) else 0}")
                 keys = {}
                 for item in data if isinstance(data, list) else data.get("keys", []):
                     provider = item.get("provider", "").lower()
                     key = item.get("api_key") or item.get("key") or ""
                     if provider and key:
                         keys[provider] = key
+                logger.info(f"BYOK keys resolved: {list(keys.keys())}")
                 return keys
+            else:
+                logger.warning(f"BYOK fetch status={resp.status_code}: {resp.text[:200]}")
     except Exception as e:
         logger.warning(f"BYOK key lookup failed: {e}")
     return {}
@@ -119,8 +123,11 @@ def _event_to_chunk(event: LLMStreamEvent) -> LLMStreamChunk:
     elif event.event == StreamEventType.ERROR:
         return LLMStreamChunk(event="error", error=event.error)
     elif event.event == StreamEventType.PROVIDER:
-        # Provider announcement — skip, not used by agent loop
-        return None
+        return LLMStreamChunk(
+            event="fallback",
+            provider=event.provider,
+            model=event.model,
+        )
     return None
 
 
