@@ -32,7 +32,7 @@ async def fetch_user_byok_keys(user_id: str, auth_token: str = "") -> Dict[str, 
         headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(
-                f"{AUTH_URL}/api/v1/user/api-keys",
+                f"{AUTH_URL}/auth/user/api-keys",
                 headers={**headers, "x-user-id": user_id},
             )
             if resp.status_code == 200:
