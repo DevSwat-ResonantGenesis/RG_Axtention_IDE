@@ -5,3 +5,9 @@ dist/
 .vscode-test/
 *.js.map
 .DS_Store
+.env
+*.log
+.idea/
+*.swp
+*.swo
+*~
