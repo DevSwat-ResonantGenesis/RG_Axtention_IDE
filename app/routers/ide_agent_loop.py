@@ -398,6 +398,9 @@ async def agent_stream(
             messages.append({"role": "user", "content": request_body.prompt})
 
             tools = _select_tools(request_body.prompt)
+            tool_names = [t["function"]["name"] for t in tools]
+            logger.info(f"Tools selected ({len(tools)}): {tool_names}")
+            logger.info(f"Prompt ({len(request_body.prompt)} chars): {request_body.prompt[:200]}")
             max_loops = min(request_body.max_loops, 50)
             total_tool_calls = 0
             total_tokens = 0
@@ -467,6 +470,7 @@ async def agent_stream(
                     yield f"event: error\ndata: {json.dumps({'error': err_msg})}\n\n"
                     return
 
+                logger.info(f"Loop {loops}: provider={last_provider} content_len={len(content)} tool_calls={len(tool_calls)} tools_in_request={len(tools)}")
                 if not tool_calls:
                     break
 
