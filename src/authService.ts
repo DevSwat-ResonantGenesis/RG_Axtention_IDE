@@ -85,6 +85,12 @@ export class ResonantAuthService {
 			const authUrl = `${authDomain}/auth/desktop-callback?port=${port}`;
 			console.log(`[Resonant Auth] Opening auth: ${authDomain} (port ${port})`);
 			await vscode.env.openExternal(vscode.Uri.parse(authUrl));
+
+			// When user is not logged in, browser redirects to login page and the
+			// port parameter is lost. After they sign in, they land on the dashboard
+			// instead of the callback. Workaround: poll for token, and if not received
+			// after a delay, re-open the desktop-callback URL (cookie is now set).
+			this._pollForTokenAndRetry(authUrl, port);
 		} catch (err: any) {
 			this._closeLocalServer();
 			vscode.window.showErrorMessage(`Sign in failed: ${err.message}`);
@@ -268,6 +274,66 @@ export class ResonantAuthService {
 			// Timeout after 10 minutes (user may need time if domain is flagged)
 			setTimeout(() => this._closeLocalServer(), 10 * 60 * 1000);
 		});
+	}
+
+	/**
+	 * Poll for token arrival. If not received within ~15s, the user likely
+	 * had to sign in on the browser first (losing the port param). Show a
+	 * notification that re-opens the desktop-callback URL — now the cookie
+	 * is set so the redirect succeeds immediately.
+	 */
+	private _pollForTokenAndRetry(authUrl: string, _port: number): void {
+		const POLL_INTERVAL_MS = 3000;
+		const FIRST_RETRY_AFTER_MS = 15000;
+		const MAX_RETRIES = 4;
+		let elapsed = 0;
+		let retryCount = 0;
+
+		const timer = setInterval(async () => {
+			elapsed += POLL_INTERVAL_MS;
+
+			// Token received — done
+			if (this.isLoggedIn()) {
+				clearInterval(timer);
+				return;
+			}
+
+			// Server closed (timeout or error) — done
+			if (!this._localServer) {
+				clearInterval(timer);
+				return;
+			}
+
+			// After initial delay, offer retry
+			if (elapsed >= FIRST_RETRY_AFTER_MS && retryCount < MAX_RETRIES) {
+				retryCount++;
+				console.log(`[Resonant Auth] No token after ${elapsed / 1000}s — retry #${retryCount}, re-opening callback URL`);
+
+				if (retryCount === 1) {
+					// First retry: silently re-open (user just finished signing in)
+					await vscode.env.openExternal(vscode.Uri.parse(authUrl));
+				} else {
+					// Subsequent retries: show notification with button
+					const action = await vscode.window.showInformationMessage(
+						'Resonant IDE: If you\'ve signed in, click below to complete login.',
+						'Complete Sign In'
+					);
+					if (action === 'Complete Sign In') {
+						await vscode.env.openExternal(vscode.Uri.parse(authUrl));
+					}
+				}
+
+				// Reset elapsed to wait another interval before next retry
+				elapsed = FIRST_RETRY_AFTER_MS - POLL_INTERVAL_MS;
+			}
+		}, POLL_INTERVAL_MS);
+
+		// Clean up timer when server closes
+		const origClose = this._closeLocalServer.bind(this);
+		this._closeLocalServer = () => {
+			clearInterval(timer);
+			origClose();
+		};
 	}
 
 	/** Safely close the local callback server */
