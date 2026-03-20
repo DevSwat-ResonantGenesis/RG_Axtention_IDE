@@ -365,8 +365,35 @@ async def call_llm_streaming(
     tools: Optional[List[Dict[str, Any]]] = None,
     temperature: float = 0.7,
     max_tokens: int = 16384,
+    local_llm: Optional[Dict[str, Any]] = None,
 ) -> AsyncIterator[LLMStreamChunk]:
-    """Call LLM with automatic fallback through provider chain."""
+    """Call LLM with automatic fallback through provider chain.
+
+    For Ollama (local LLM): uses the URL from local_llm config to call the
+    user's local Ollama instance (OpenAI-compatible API). If unreachable,
+    falls back to cloud providers.
+    """
+    # Handle local Ollama provider
+    if preferred_provider == "ollama" and local_llm:
+        ollama_url = local_llm.get("url", "http://localhost:11434")
+        ollama_model = local_llm.get("model", preferred_model)
+        ollama_ctx = local_llm.get("context_length", 32768)
+        api_url = f"{ollama_url.rstrip('/')}/v1/chat/completions"
+        logger.info(f"Calling local Ollama: {api_url} model={ollama_model}")
+        try:
+            async for chunk in _stream_openai_compatible(
+                api_url, messages, ollama_model, "ollama",
+                tools, temperature, min(max_tokens, ollama_ctx), "ollama",
+            ):
+                if chunk.event == "error":
+                    logger.warning(f"Local Ollama failed: {chunk.error}, falling back to cloud...")
+                    break
+                yield chunk
+                if chunk.event == "done":
+                    return
+        except Exception as e:
+            logger.warning(f"Local Ollama exception: {e}, falling back to cloud...")
+
     chain = resolve_provider_chain(preferred_provider, user_keys)
     if not chain:
         yield LLMStreamChunk(event="error", error="No API keys configured for any provider")

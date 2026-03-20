@@ -85,6 +85,7 @@ class AgentStreamRequest(BaseModel):
     model_id: Optional[str] = None  # e.g. "resonant-anthropic-claude-sonnet-4-20250514"
     context: Optional[List[Dict[str, Any]]] = None
     max_loops: int = 25
+    local_llm: Optional[Dict[str, Any]] = None  # {url, model, context_length} — for Ollama
 
 
 class ToolResultRequest(BaseModel):
@@ -422,6 +423,7 @@ async def agent_stream(
                         tools=tools,
                         temperature=0.7,
                         max_tokens=16384,
+                        local_llm=request_body.local_llm,
                     ):
                         if chunk.event == "chunk":
                             if chunk.content:
