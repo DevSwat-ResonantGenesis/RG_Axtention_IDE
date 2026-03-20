@@ -559,7 +559,54 @@ async def agent_stream(
                     yield f"event: error\ndata: {json.dumps({'error': err_msg})}\n\n"
                     return
 
-                logger.info(f"Loop {loops}: provider={last_provider} content_len={len(content)} tool_calls={len(tool_calls)} tools_in_request={len(tools)}")
+                logger.info(f"Loop {loops}: provider={last_provider} content_len={len(content)} tool_calls={len(tool_calls)} tools_in_request={len(tools)} tool_choice={loop_tool_choice}")
+
+                # If tool_choice was "required" but model returned nothing, retry with "auto"
+                if not tool_calls and not content and loop_tool_choice == "required":
+                    logger.info(f"Loop {loops}: tool_choice=required returned empty — retrying with auto")
+                    content = ""
+                    tool_calls = []
+                    fallback_attempt = 0
+                    loop_fallback_chain = []
+                    try:
+                        async for chunk in call_llm_streaming(
+                            messages=messages,
+                            preferred_provider=provider_key,
+                            preferred_model=model_name,
+                            user_keys=user_keys,
+                            tools=tools,
+                            tool_choice="auto",
+                            temperature=0.7,
+                            max_tokens=16384,
+                            local_llm=request_body.local_llm,
+                        ):
+                            if chunk.event == "chunk":
+                                if chunk.content:
+                                    content += chunk.content
+                                    yield f"event: text\ndata: {json.dumps({'content': chunk.content})}\n\n"
+                            elif chunk.event == "fallback":
+                                fallback_attempt += 1
+                                fb_info = {'provider': chunk.provider, 'model': chunk.model, 'attempt': fallback_attempt}
+                                loop_fallback_chain.append(fb_info)
+                                yield f"event: fallback\ndata: {json.dumps(fb_info)}\n\n"
+                            elif chunk.event == "tool_calls":
+                                tool_calls = chunk.tool_calls or []
+                            elif chunk.event == "done":
+                                if chunk.usage:
+                                    u = chunk.usage
+                                    total_tokens += u.get("total_tokens", 0) or (u.get("prompt_tokens", 0) + u.get("completion_tokens", 0))
+                                last_provider = chunk.provider or provider_key
+                                last_model = chunk.model or model_name
+                                if loop_fallback_chain:
+                                    fallback_chain.extend(loop_fallback_chain)
+                            elif chunk.event == "error":
+                                yield f"event: error\ndata: {json.dumps({'error': chunk.error})}\n\n"
+                                return
+                    except Exception as e:
+                        yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+                        return
+                    logger.info(f"Loop {loops} (retry auto): content_len={len(content)} tool_calls={len(tool_calls)}")
+
                 if not tool_calls:
                     break
 
