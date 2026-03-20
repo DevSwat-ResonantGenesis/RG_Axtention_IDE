@@ -448,7 +448,8 @@ async def agent_stream(
                     err_msg = str(e)
                     if "429" in err_msg and loops < max_loops:
                         wait = min(loops * 20, 60)
-                        yield f"event: text\ndata: {json.dumps({'content': f'\\n> ⏳ Rate limit hit — waiting {wait}s...\\n'})}\n\n"
+                        rate_msg = "\n> ⏳ Rate limit hit — waiting " + str(wait) + "s...\n"
+                        yield f"event: text\ndata: {json.dumps({'content': rate_msg})}\n\n"
                         await asyncio.sleep(wait)
                         continue
                     yield f"event: error\ndata: {json.dumps({'error': err_msg})}\n\n"
