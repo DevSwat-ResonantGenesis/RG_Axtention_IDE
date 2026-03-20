@@ -1,0 +1,214 @@
+{
+  "name": "rg-axtention-ide",
+  "displayName": "Resonant AI — Agentic Coding Assistant",
+  "description": "AI-powered agentic coding assistant with 59+ local tools. Local file editing, terminal execution, code analysis, search, and more — like Cascade/Windsurf but for the Resonant Genesis platform.",
+  "icon": "media/icon.png",
+  "version": "1.0.0",
+  "publisher": "resonant-genesis",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DevSwat-ResonantGenesis/RG_Axtention_IDE"
+  },
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "ai",
+    "assistant",
+    "copilot",
+    "agent",
+    "agentic",
+    "coding",
+    "resonant",
+    "tools",
+    "llm"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "*"
+  ],
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "resonant-ai-sidebar",
+          "title": "Resonant AI",
+          "icon": "$(sparkle)"
+        }
+      ]
+    },
+    "views": {
+      "resonant-ai-sidebar": [
+        {
+          "type": "webview",
+          "id": "resonant.chatView",
+          "name": "Resonant AI Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "resonant.openChat",
+        "title": "Open Resonant AI Chat",
+        "category": "Resonant AI",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "resonant.newConversation",
+        "title": "New Conversation",
+        "category": "Resonant AI"
+      },
+      {
+        "command": "resonant.login",
+        "title": "Sign In",
+        "category": "Resonant AI"
+      },
+      {
+        "command": "resonant.logout",
+        "title": "Sign Out",
+        "category": "Resonant AI"
+      },
+      {
+        "command": "resonant.setApiKey",
+        "title": "Set API Key",
+        "category": "Resonant AI"
+      },
+      {
+        "command": "resonant.openProfile",
+        "title": "Profile & Account Settings",
+        "category": "Resonant AI",
+        "icon": "$(account)"
+      },
+      {
+        "command": "resonant.openSettingsPanel",
+        "title": "Settings Panel",
+        "category": "Resonant AI",
+        "icon": "$(settings-gear)"
+      },
+      {
+        "command": "resonant.refreshProviders",
+        "title": "Refresh Providers & Agents",
+        "category": "Resonant AI",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "resonant.toggleChatView",
+        "title": "Toggle Resonant AI Chat",
+        "category": "Resonant AI",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "resonant.localLLM.testConnection",
+        "title": "Local LLM: Test Connection",
+        "category": "Resonant AI",
+        "icon": "$(plug)"
+      },
+      {
+        "command": "resonant.localLLM.listModels",
+        "title": "Local LLM: List Available Models",
+        "category": "Resonant AI",
+        "icon": "$(list-unordered)"
+      },
+      {
+        "command": "resonant.localLLM.selectModel",
+        "title": "Local LLM: Select Model",
+        "category": "Resonant AI",
+        "icon": "$(symbol-enum)"
+      },
+      {
+        "command": "resonant.localLLM.toggle",
+        "title": "Local LLM: Toggle On/Off",
+        "category": "Resonant AI",
+        "icon": "$(toggle-on)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "resonant.openChat",
+        "key": "ctrl+shift+a",
+        "mac": "cmd+shift+a"
+      }
+    ],
+    "authentication": [
+      {
+        "id": "resonant-genesis",
+        "label": "Resonant Genesis"
+      }
+    ],
+    "menus": {
+      "commandPalette": [
+        { "command": "resonant.openChat", "when": "true" },
+        { "command": "resonant.login", "when": "true" },
+        { "command": "resonant.logout", "when": "true" },
+        { "command": "resonant.openProfile", "when": "true" }
+      ]
+    },
+    "configuration": {
+      "title": "Resonant AI",
+      "properties": {
+        "resonant.apiUrl": {
+          "type": "string",
+          "default": "https://dev-swat.com",
+          "description": "Backend API URL for Resonant Genesis platform"
+        },
+        "resonant.maxToolLoops": {
+          "type": "number",
+          "default": 15,
+          "description": "Maximum tool execution loops per message"
+        },
+        "resonant.chatMode": {
+          "type": "string",
+          "enum": ["cloud", "local"],
+          "default": "local",
+          "description": "Chat mode: 'cloud' uses server-side agentic chat (/agentic-chat/stream), 'local' uses client-side tool execution (/ide/completions)"
+        },
+        "resonant.localLLM.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable local LLM mode — connect to Ollama or any OpenAI-compatible server running on your machine. No internet or API keys needed."
+        },
+        "resonant.localLLM.url": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "description": "Local LLM server URL. Ollama default: http://localhost:11434, LM Studio: http://localhost:1234, llama.cpp: http://localhost:8080"
+        },
+        "resonant.localLLM.model": {
+          "type": "string",
+          "default": "",
+          "description": "Local model name (e.g. llama3.1:8b, codellama:13b, deepseek-coder:6.7b). Leave empty to auto-detect."
+        },
+        "resonant.localLLM.contextLength": {
+          "type": "number",
+          "default": 32768,
+          "description": "Context window size for local model (tokens)."
+        }
+      }
+    }
+  },
+  "extensionPack": [],
+  "galleryBanner": {
+    "color": "#1e1e1e",
+    "theme": "dark"
+  },
+  "scripts": {
+    "compile": "tsc -p ./tsconfig.json",
+    "watch": "tsc -watch -p ./tsconfig.json",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package --no-dependencies",
+    "publish": "vsce publish --no-dependencies",
+    "pretest": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.15",
+    "@types/vscode": "^1.93.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.5.0"
+  }
+}
