@@ -41,26 +41,27 @@ def _get_client() -> UnifiedLLMClient:
 # ── BYOK key fetching ──
 
 async def fetch_user_byok_keys(user_id: str, auth_token: str = "") -> Dict[str, str]:
-    """Fetch user's Bring-Your-Own-Key keys from auth service."""
+    """Fetch user's Bring-Your-Own-Key keys from auth service.
+
+    Uses /api-keys/user/{user_id} internal endpoint which returns
+    decrypted keys without requiring JWT validation.
+    """
     if not user_id:
         return {}
     try:
-        headers = {"Authorization": f"Bearer {auth_token}"} if auth_token else {}
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                f"{AUTH_URL}/auth/user/api-keys",
-                headers={**headers, "x-user-id": user_id},
-            )
+            resp = await client.get(f"{AUTH_URL}/api-keys/user/{user_id}")
             if resp.status_code == 200:
                 data = resp.json()
-                logger.info(f"BYOK response type={type(data).__name__} len={len(data) if isinstance(data, (list, dict)) else 0}")
+                items = data.get("keys", []) if isinstance(data, dict) else data if isinstance(data, list) else []
                 keys = {}
-                for item in data if isinstance(data, list) else data.get("keys", []):
+                for item in items:
                     provider = item.get("provider", "").lower()
-                    key = item.get("api_key") or item.get("key") or ""
-                    if provider and key:
+                    key = item.get("decrypted_key") or item.get("api_key") or item.get("key") or ""
+                    is_valid = item.get("is_valid", True)
+                    if provider and key and is_valid:
                         keys[provider] = key
-                logger.info(f"BYOK keys resolved: {list(keys.keys())}")
+                logger.info(f"BYOK keys resolved for user {user_id[:8]}: {list(keys.keys())}")
                 return keys
             else:
                 logger.warning(f"BYOK fetch status={resp.status_code}: {resp.text[:200]}")
