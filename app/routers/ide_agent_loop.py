@@ -315,7 +315,79 @@ You are Resonant AI by Resonant Genesis. Not GPT, Claude, or Llama."""
 
 # ── Helper: summarize tool result for message history ──
 
+def _summarize_cv_result(name: str, raw: str) -> str:
+    """Smart summarizer for code_visualizer_* tool results.
+    Preserves stats, governance scores, and a meaningful subset of nodes."""
+    CV_CAP = 12000
+    if len(raw) <= CV_CAP:
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return raw[:CV_CAP - 60] + f"\n\n... (truncated, {len(raw)} total chars)"
+
+    summary = {}
+
+    # Always preserve stats and top-level metadata
+    for key in ("stats", "report", "ci_pass", "total", "endpoints", "type",
+                "start", "outgoing_count", "incoming_count", "pipeline",
+                "node_status", "live_nodes", "invalid_nodes"):
+        if key in parsed:
+            summary[key] = parsed[key]
+
+    # Preserve pipelines summary (names + node counts, not full data)
+    if "pipelines" in parsed:
+        summary["pipelines"] = {}
+        for pname, pdata in parsed["pipelines"].items():
+            if isinstance(pdata, dict):
+                summary["pipelines"][pname] = {
+                    "name": pdata.get("name", pname),
+                    "node_count": len(pdata.get("nodes", [])),
+                    "connection_count": len(pdata.get("connections", [])),
+                }
+            else:
+                summary["pipelines"][pname] = pdata
+
+    # Preserve services
+    if "services" in parsed:
+        summary["services"] = {k: len(v) if isinstance(v, list) else v for k, v in parsed["services"].items()}
+
+    # Preserve a subset of nodes (prioritize endpoints and functions, cap at 60)
+    if "nodes" in parsed and isinstance(parsed["nodes"], list):
+        nodes = parsed["nodes"]
+        endpoints = [n for n in nodes if n.get("type") == "api_endpoint"]
+        functions = [n for n in nodes if n.get("type") == "function"]
+        classes = [n for n in nodes if n.get("type") == "class"]
+        others = [n for n in nodes if n.get("type") not in ("api_endpoint", "function", "class")]
+        kept = (endpoints[:20] + classes[:10] + functions[:20] + others[:10])[:60]
+        summary["nodes"] = kept
+        summary["_nodes_shown"] = len(kept)
+        summary["_nodes_total"] = len(nodes)
+
+    # Preserve a subset of connections (cap at 40)
+    if "connections" in parsed and isinstance(parsed["connections"], list):
+        conns = parsed["connections"]
+        summary["connections"] = conns[:40]
+        summary["_connections_shown"] = min(40, len(conns))
+        summary["_connections_total"] = len(conns)
+
+    # Preserve functions list if present
+    if "functions" in parsed and isinstance(parsed["functions"], list):
+        funcs = parsed["functions"]
+        summary["functions"] = funcs[:40]
+        summary["_functions_shown"] = min(40, len(funcs))
+        summary["_functions_total"] = len(funcs)
+
+    result = json.dumps(summary)
+    if len(result) > CV_CAP:
+        return result[:CV_CAP - 60] + f"\n... (truncated, {len(result)} chars)"
+    return result
+
+
 def _summarize_tool_result(name: str, raw: str, cap: int = 3000) -> str:
+    # Code Visualizer tools get special treatment — much higher cap + smart summarization
+    if name.startswith("code_visualizer_"):
+        return _summarize_cv_result(name, raw)
     if len(raw) <= cap:
         return raw
     try:
@@ -337,7 +409,12 @@ def _compress_old_messages(msgs: List[Dict[str, Any]]) -> None:
     for i in range(1, cutoff):
         m = msgs[i]
         if m.get("role") == "tool" and isinstance(m.get("content"), str) and len(m["content"]) > 200:
-            m["content"] = f"[Tool result for {m.get('name', 'unknown')}: {len(m['content'])} chars — compressed]"
+            # Preserve code_visualizer results better — keep 2000 chars instead of wiping
+            if m.get("name", "").startswith("code_visualizer_"):
+                if len(m["content"]) > 2000:
+                    m["content"] = m["content"][:2000] + f"\n... (compressed from {len(m['content'])} chars)"
+            else:
+                m["content"] = f"[Tool result for {m.get('name', 'unknown')}: {len(m['content'])} chars — compressed]"
 
 
 # ── Main agent stream endpoint ──
