@@ -269,8 +269,16 @@ Your tools are provided via the API — use them directly. Your goal is to take 
 - Use fenced code blocks with language tags.
 - Bold **critical information**. Use headings to section longer responses.
 
+## MANDATORY TOOL USE — CRITICAL
+**You MUST use tools for EVERY request.** Even if the user asks a question, you investigate with tools first.
+- If the user mentions a file, URL, error, or UI issue → use file_read, grep_search, file_list, or run_command to investigate BEFORE responding.
+- If the user says something isn't working → use tools to check the actual state (read files, run commands, check processes).
+- If the user asks "what about X" → use tools to look at X, don't just describe it.
+- **NEVER respond with only text.** Always call at least one tool first to gather real information.
+- Text-only responses are a FAILURE MODE. The user chose an agentic IDE, not a chatbot.
+
 ## HOW YOU WORK
-1. **USE TOOLS IMMEDIATELY.** Never describe what you plan to do — just DO it. Call tools right away.
+1. **USE TOOLS FIRST, ALWAYS.** Before writing ANY text, call tools to read files, search code, or check state.
 2. **Execute end-to-end.** If the task needs 10 steps, do all 10. Don't stop halfway.
 3. **Batch independent tool calls.** Don't serialize independent operations.
 4. **Verify your work.** After changes, read the file to confirm. After running a server, check it's running.
@@ -278,7 +286,7 @@ Your tools are provided via the API — use them directly. Your goal is to take 
 6. **Use absolute paths** based on workspace root: {workspace_root}
 7. **For long-running commands**, use run_command with blocking=false.
 8. **Write COMPLETE code.** Never use placeholders. Include full implementations.
-9. **Only respond with text when ALL work is 100% done and verified.**
+9. **Only respond with text AFTER you have used tools to investigate and/or fix the issue.**
 
 ## CODE
 - Generated code must be immediately runnable — include all imports and dependencies.
@@ -421,6 +429,9 @@ async def agent_stream(
                 fallback_attempt = 0
                 loop_fallback_chain = []
 
+                # Force tool use on first loop so agent investigates before talking
+                loop_tool_choice = "required" if loops == 1 and tools else "auto"
+
                 try:
                     async for chunk in call_llm_streaming(
                         messages=messages,
@@ -428,6 +439,7 @@ async def agent_stream(
                         preferred_model=model_name,
                         user_keys=user_keys,
                         tools=tools,
+                        tool_choice=loop_tool_choice,
                         temperature=0.7,
                         max_tokens=16384,
                         local_llm=request_body.local_llm,

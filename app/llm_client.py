@@ -140,6 +140,7 @@ async def call_llm_streaming(
     preferred_model: str,
     user_keys: Dict[str, str],
     tools: Optional[List[Dict[str, Any]]] = None,
+    tool_choice: Optional[str] = None,
     temperature: float = 0.7,
     max_tokens: int = 16384,
     local_llm: Optional[Dict[str, Any]] = None,
@@ -204,6 +205,7 @@ async def call_llm_streaming(
         temperature=temperature,
         max_tokens=max_tokens,
         tools=tools,
+        tool_choice=tool_choice,
         stream=True,
     )
 
