@@ -18,11 +18,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+import httpx
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -32,6 +34,9 @@ from ..llm_client import call_llm_streaming, fetch_user_byok_keys
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ide", tags=["ide-agent"])
+
+# Code Visualizer (AST analysis) service — accessible via Docker network
+CODE_VISUALIZER_URL = os.getenv("CODE_VISUALIZER_URL", "http://rg_ast_analysis:8000")
 
 
 # ── Session store ──
@@ -148,6 +153,7 @@ def _build_tool_definitions() -> List[Dict[str, Any]]:
         {"type": F, "function": {"name": "code_visualizer_pipeline", "description": "Auto-detected pipeline flow.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "pipeline_name": {"type": "string"}}, "required": ["path", "pipeline_name"]}}},
         {"type": F, "function": {"name": "code_visualizer_filter", "description": "Filter graph by file, type, keyword.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "file_path": {"type": "string"}, "node_type": {"type": "string"}, "keyword": {"type": "string"}}, "required": ["path"]}}},
         {"type": F, "function": {"name": "code_visualizer_by_type", "description": "Get all nodes of a type.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "node_type": {"type": "string"}}, "required": ["path", "node_type"]}}},
+        {"type": F, "function": {"name": "code_visualizer_scan_github", "description": "AST-scan a GitHub repository by URL. Clones and analyzes remotely — no local checkout needed. Supports branch selection and private repos with token.", "parameters": {"type": "object", "properties": {"repo_url": {"type": "string", "description": "GitHub repository URL (e.g. https://github.com/user/repo)"}, "branch": {"type": "string", "description": "Branch to scan (default: main/master)"}, "token": {"type": "string", "description": "GitHub PAT for private repos (optional)"}}, "required": ["repo_url"]}}},
     ])
 
     # PLANNING & MEMORY
@@ -225,7 +231,7 @@ def _select_tools(query: str) -> List[Dict[str, Any]]:
         names |= _GIT_NAMES
     if re.search(r'\b(http|url|web|search|browse|fetch|download|api|endpoint|curl)\b', q) or '://' in q:
         names |= _WEB_NAMES
-    if re.search(r'\b(analy[sz]|visuali[sz]|architecture|structure|dependen|scan|overview|governance|dead.?code|pipeline|graph.?janitor|drift|trace.?flow|codebase|ast)', q):
+    if re.search(r'\b(analy[sz]|visuali[sz]|architecture|structure|dependen|scan|overview|governance|dead.?code|pipeline|graph.?janitor|drift|trace.?flow|codebase|ast|github\.com|repo)', q) or 'github.com/' in q:
         names |= _VIZ_NAMES
     if re.search(r'\b(plan|todo|task|step|remember|memory|save|note)\b', q):
         names |= _PLAN_NAMES
@@ -415,6 +421,39 @@ def _compress_old_messages(msgs: List[Dict[str, Any]]) -> None:
                     m["content"] = m["content"][:2000] + f"\n... (compressed from {len(m['content'])} chars)"
             else:
                 m["content"] = f"[Tool result for {m.get('name', 'unknown')}: {len(m['content'])} chars — compressed]"
+
+
+# ── Server-side tool execution (tools that don't run on the client) ──
+
+_SERVER_SIDE_TOOLS = {"code_visualizer_scan_github"}
+
+
+async def _execute_server_side_tool(name: str, args: Dict[str, Any]) -> str:
+    """Execute a tool server-side and return JSON result string."""
+    if name == "code_visualizer_scan_github":
+        repo_url = (args.get("repo_url") or "").strip()
+        if not repo_url:
+            return json.dumps({"error": "Missing repo_url"})
+        payload: Dict[str, Any] = {"repo_url": repo_url}
+        if args.get("branch"):
+            payload["branch"] = args["branch"]
+        if args.get("token"):
+            payload["token"] = args["token"]
+        try:
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                resp = await client.post(
+                    f"{CODE_VISUALIZER_URL}/api/v1/scan/github",
+                    json=payload,
+                )
+                if resp.status_code != 200:
+                    return json.dumps({"error": f"Code Visualizer returned {resp.status_code}: {resp.text[:500]}"})
+                return resp.text
+        except httpx.TimeoutException:
+            return json.dumps({"error": "GitHub repo scan timed out (180s). The repo may be too large."})
+        except Exception as e:
+            return json.dumps({"error": f"Failed to call Code Visualizer: {str(e)}"})
+
+    return json.dumps({"error": f"Unknown server-side tool: {name}"})
 
 
 # ── Main agent stream endpoint ──
@@ -610,7 +649,7 @@ async def agent_stream(
                 if not tool_calls:
                     break
 
-                # ── Execute tools via client ──
+                # ── Execute tools ──
                 for tc in tool_calls:
                     tc_name = tc["function"]["name"]
                     tc_id = tc.get("id") or f"call_{loops}_{total_tool_calls}"
@@ -623,23 +662,32 @@ async def agent_stream(
 
                     total_tool_calls += 1
 
-                    yield f"event: execute_tool\ndata: {json.dumps({'session_id': session.id, 'tool_call_id': tc_id, 'name': tc_name, 'arguments': tc_args})}\n\n"
+                    # Server-side tools: execute directly, don't send to client
+                    if tc_name in _SERVER_SIDE_TOOLS:
+                        yield f"event: execute_tool\ndata: {json.dumps({'session_id': session.id, 'tool_call_id': tc_id, 'name': tc_name, 'arguments': tc_args, 'server_side': True})}\n\n"
+                        logger.info(f"Executing server-side tool: {tc_name} args={json.dumps(tc_args)[:200]}")
+                        tool_result = await _execute_server_side_tool(tc_name, tc_args)
+                        is_error = '"error"' in tool_result
+                        yield f"event: tool_done\ndata: {json.dumps({'tool_call_id': tc_id, 'name': tc_name, 'status': 'error' if is_error else 'ok'})}\n\n"
+                    else:
+                        # Client-side tools: send to client, wait for result
+                        yield f"event: execute_tool\ndata: {json.dumps({'session_id': session.id, 'tool_call_id': tc_id, 'name': tc_name, 'arguments': tc_args})}\n\n"
 
-                    try:
-                        tool_result_data = await asyncio.wait_for(
-                            session.tool_result_queue.get(),
-                            timeout=120,
-                        )
-                    except asyncio.TimeoutError:
-                        tool_result_data = {
-                            "tool_call_id": tc_id,
-                            "name": tc_name,
-                            "result": json.dumps({"error": "Tool execution timed out (120s)"}),
-                        }
+                        try:
+                            tool_result_data = await asyncio.wait_for(
+                                session.tool_result_queue.get(),
+                                timeout=120,
+                            )
+                        except asyncio.TimeoutError:
+                            tool_result_data = {
+                                "tool_call_id": tc_id,
+                                "name": tc_name,
+                                "result": json.dumps({"error": "Tool execution timed out (120s)"}),
+                            }
 
-                    tool_result = tool_result_data.get("result", "{}")
-                    is_error = '"error"' in tool_result
-                    yield f"event: tool_done\ndata: {json.dumps({'tool_call_id': tc_id, 'name': tc_name, 'status': 'error' if is_error else 'ok'})}\n\n"
+                        tool_result = tool_result_data.get("result", "{}")
+                        is_error = '"error"' in tool_result
+                        yield f"event: tool_done\ndata: {json.dumps({'tool_call_id': tc_id, 'name': tc_name, 'status': 'error' if is_error else 'ok'})}\n\n"
 
                     messages.append({
                         "role": "assistant",
