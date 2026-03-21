@@ -316,78 +316,117 @@ Keep going until it WORKS — try at least 3 different approaches before giving 
 FORBIDDEN: "Please check...", "Try reinstalling...", "You may need to..."
 You DO the work, you don't REPORT problems.
 
+## CODE VISUALIZER (Codebase Analysis)
+- For GitHub repos: use code_visualizer_scan_github with the URL. NEVER use git clone or run_command to clone repos.
+- For local projects: use code_visualizer_scan with the absolute path.
+- A formatted human-readable report is shown to the user automatically by the IDE client. You receive a compact text summary.
+- After a scan, respond with architectural INSIGHTS — e.g. "This is a microservice architecture with 6 services, 793 functions..."
+- NEVER dump raw JSON or repeat data verbatim. Interpret and explain findings in natural language.
+- For follow-up analysis, use targeted tools: code_visualizer_functions, code_visualizer_governance, code_visualizer_trace, code_visualizer_filter.
+- When user says "analyze", "scan", "visualize", or pastes a GitHub URL → use code_visualizer tools immediately.
+
 You are Resonant AI by Resonant Genesis. Not GPT, Claude, or Llama."""
 
 
 # ── Helper: summarize tool result for message history ──
 
 def _summarize_cv_result(name: str, raw: str) -> str:
-    """Smart summarizer for code_visualizer_* tool results.
-    Preserves stats, governance scores, and a meaningful subset of nodes."""
-    CV_CAP = 12000
-    if len(raw) <= CV_CAP:
-        return raw
+    """Human-readable summary of code_visualizer results for the LLM.
+    The full formatted report is shown to the user by the IDE client.
+    This returns compact text so the LLM can discuss findings intelligently."""
     try:
         parsed = json.loads(raw)
     except Exception:
-        return raw[:CV_CAP - 60] + f"\n\n... (truncated, {len(raw)} total chars)"
+        if len(raw) > 3000:
+            return raw[:3000] + "\n... (truncated)"
+        return raw
 
-    summary = {}
+    lines = [f"Code Visualizer ({name}) completed."]
 
-    # Always preserve stats and top-level metadata
-    for key in ("stats", "report", "ci_pass", "total", "endpoints", "type",
-                "start", "outgoing_count", "incoming_count", "pipeline",
-                "node_status", "live_nodes", "invalid_nodes"):
-        if key in parsed:
-            summary[key] = parsed[key]
+    # Source info
+    src = parsed.get("_source", {})
+    if src.get("url"):
+        lines.append(f"Source: {src['url']}")
 
-    # Preserve pipelines summary (names + node counts, not full data)
-    if "pipelines" in parsed:
-        summary["pipelines"] = {}
-        for pname, pdata in parsed["pipelines"].items():
-            if isinstance(pdata, dict):
-                summary["pipelines"][pname] = {
-                    "name": pdata.get("name", pname),
-                    "node_count": len(pdata.get("nodes", [])),
-                    "connection_count": len(pdata.get("connections", [])),
-                }
-            else:
-                summary["pipelines"][pname] = pdata
+    # Stats
+    s = parsed.get("stats") or parsed.get("analysis", {}).get("stats", {})
+    if s:
+        parts = []
+        if s.get("total_services"): parts.append(f"{s['total_services']} services")
+        if s.get("files_analyzed"): parts.append(f"{s['files_analyzed']} files analyzed")
+        if s.get("total_functions"): parts.append(f"{s['total_functions']} functions")
+        if s.get("total_endpoints"): parts.append(f"{s['total_endpoints']} endpoints")
+        if s.get("total_connections"): parts.append(f"{s['total_connections']} connections")
+        if s.get("broken_connections"): parts.append(f"{s['broken_connections']} broken connections")
+        if parts:
+            lines.append("Stats: " + ", ".join(parts))
+        if s.get("truncated"):
+            lines.append(f"WARNING: Analysis capped at {s.get('files_analyzed', 500)} files (large repo).")
 
-    # Preserve services
-    if "services" in parsed:
-        summary["services"] = {k: len(v) if isinstance(v, list) else v for k, v in parsed["services"].items()}
+    # Services
+    services = parsed.get("services", {})
+    if services:
+        svc_parts = [f"{k} ({len(v) if isinstance(v, list) else v} files)" for k, v in list(services.items())[:10]]
+        lines.append("Services: " + ", ".join(svc_parts))
 
-    # Preserve a subset of nodes (prioritize endpoints and functions, cap at 60)
-    if "nodes" in parsed and isinstance(parsed["nodes"], list):
-        nodes = parsed["nodes"]
-        endpoints = [n for n in nodes if n.get("type") == "api_endpoint"]
-        functions = [n for n in nodes if n.get("type") == "function"]
-        classes = [n for n in nodes if n.get("type") == "class"]
-        others = [n for n in nodes if n.get("type") not in ("api_endpoint", "function", "class")]
-        kept = (endpoints[:20] + classes[:10] + functions[:20] + others[:10])[:60]
-        summary["nodes"] = kept
-        summary["_nodes_shown"] = len(kept)
-        summary["_nodes_total"] = len(nodes)
+    # Top functions from nodes
+    func_nodes = [n for n in parsed.get("nodes", []) if n.get("type") == "function"]
+    if func_nodes:
+        lines.append(f"Functions: {len(func_nodes)} total")
+        for fn in func_nodes[:8]:
+            loc = f":{fn.get('line_start', '')}" if fn.get("line_start") else ""
+            lines.append(f"  - {fn.get('name', '?')} ({fn.get('file_path', '?')}{loc})")
+        if len(func_nodes) > 8:
+            lines.append(f"  ... and {len(func_nodes) - 8} more")
 
-    # Preserve a subset of connections (cap at 40)
-    if "connections" in parsed and isinstance(parsed["connections"], list):
-        conns = parsed["connections"]
-        summary["connections"] = conns[:40]
-        summary["_connections_shown"] = min(40, len(conns))
-        summary["_connections_total"] = len(conns)
+    # Endpoints from nodes
+    ep_nodes = [n for n in parsed.get("nodes", []) if n.get("type") == "api_endpoint"]
+    if ep_nodes:
+        lines.append(f"API Endpoints: {len(ep_nodes)}")
+        for ep in ep_nodes[:8]:
+            route = (ep.get("metadata") or {}).get("route") or ep.get("name", "?")
+            lines.append(f"  - {route} ({ep.get('file_path', '?')})")
+        if len(ep_nodes) > 8:
+            lines.append(f"  ... and {len(ep_nodes) - 8} more")
 
-    # Preserve functions list if present
-    if "functions" in parsed and isinstance(parsed["functions"], list):
-        funcs = parsed["functions"]
-        summary["functions"] = funcs[:40]
-        summary["_functions_shown"] = min(40, len(funcs))
-        summary["_functions_total"] = len(funcs)
+    # Governance scores
+    if parsed.get("reachability_score") is not None:
+        lines.append(f"Reachability: {parsed['reachability_score']}")
+    if parsed.get("drift_score") is not None:
+        lines.append(f"Drift: {parsed['drift_score']}")
+    if parsed.get("ci_pass") is not None:
+        lines.append(f"CI Pass: {parsed['ci_pass']}")
+    violations = parsed.get("violations", [])
+    if violations:
+        lines.append(f"Violations: {len(violations)}")
+        for v in violations[:5]:
+            lines.append(f"  - {v.get('type', v.get('rule', 'violation'))}: {str(v.get('message', v.get('details', '')))[:120]}")
 
-    result = json.dumps(summary)
-    if len(result) > CV_CAP:
-        return result[:CV_CAP - 60] + f"\n... (truncated, {len(result)} chars)"
-    return result
+    # Functions list (from code_visualizer_functions tool)
+    funcs_list = parsed.get("functions", [])
+    if funcs_list and not func_nodes:
+        lines.append(f"Functions listed: {len(funcs_list)}")
+        for fn in funcs_list[:10]:
+            if isinstance(fn, dict):
+                lines.append(f"  - {fn.get('name', '?')} ({fn.get('file', '?')}:{fn.get('line', '?')})")
+        if len(funcs_list) > 10:
+            lines.append(f"  ... and {len(funcs_list) - 10} more")
+
+    # Pipelines
+    pipelines = parsed.get("pipelines", {})
+    if pipelines:
+        pip_parts = []
+        for pname, pdata in list(pipelines.items())[:6]:
+            nc = len(pdata.get("nodes", [])) if isinstance(pdata, dict) else 0
+            if nc > 0:
+                pip_parts.append(f"{pname} ({nc} nodes)")
+        if pip_parts:
+            lines.append("Pipelines: " + ", ".join(pip_parts))
+
+    lines.append("")
+    lines.append("Full formatted report shown to user. Discuss the architecture, patterns, and any issues. Do NOT repeat raw data.")
+
+    return "\n".join(lines)
 
 
 def _summarize_tool_result(name: str, raw: str, cap: int = 3000) -> str:
