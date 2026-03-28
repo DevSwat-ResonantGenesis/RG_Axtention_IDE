@@ -38,6 +38,79 @@ router = APIRouter(prefix="/ide", tags=["ide-agent"])
 # Code Visualizer (AST analysis) service — accessible via Docker network
 CODE_VISUALIZER_URL = os.getenv("CODE_VISUALIZER_URL", "http://rg_ast_analysis:8000")
 
+# LOC tracking service — sends telemetry to ide_service for dashboard stats
+LOC_SERVICE_URL = os.getenv("LOC_SERVICE_URL", "http://ide_service:8080")
+
+# Tools that modify files — tracked for LOC stats
+_FILE_WRITE_TOOLS = {"file_write", "file_edit", "multi_edit", "notebook_edit"}
+
+
+async def _track_loc_event(
+    user_id: str,
+    session_id: str,
+    tool_name: str,
+    tool_args: dict,
+    tool_result: str,
+):
+    """Fire-and-forget POST LOC event to ide_service after file write/edit."""
+    try:
+        file_path = tool_args.get("path") or tool_args.get("file_path") or tool_args.get("target_file") or tool_args.get("absolute_path") or ""
+        content = tool_args.get("content") or tool_args.get("new_string") or tool_args.get("code_content") or tool_args.get("new_source") or ""
+        old_content = tool_args.get("old_string") or ""
+
+        new_lines = content.count("\n") + (1 if content and not content.endswith("\n") else 0) if content else 0
+        old_lines = old_content.count("\n") + (1 if old_content and not old_content.endswith("\n") else 0) if old_content else 0
+
+        if tool_name == "file_write":
+            lines_written = new_lines
+            lines_edited = 0
+            lines_deleted = 0
+        elif tool_name in ("file_edit", "notebook_edit"):
+            lines_written = max(0, new_lines - old_lines)
+            lines_edited = min(new_lines, old_lines)
+            lines_deleted = max(0, old_lines - new_lines)
+        elif tool_name == "multi_edit":
+            edits = tool_args.get("edits", [])
+            lines_written = 0
+            lines_edited = 0
+            lines_deleted = 0
+            for edit in edits:
+                ns = edit.get("new_string", "")
+                os_str = edit.get("old_string", "")
+                nl = ns.count("\n") + (1 if ns and not ns.endswith("\n") else 0)
+                ol = os_str.count("\n") + (1 if os_str and not os_str.endswith("\n") else 0)
+                lines_written += max(0, nl - ol)
+                lines_edited += min(nl, ol)
+                lines_deleted += max(0, ol - nl)
+            file_path = tool_args.get("file_path") or file_path
+        else:
+            return
+
+        if lines_written == 0 and lines_edited == 0 and lines_deleted == 0:
+            return
+
+        net_lines = lines_written - lines_deleted
+
+        batch = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "events": [{
+                "user_id": user_id,
+                "session_id": session_id,
+                "tool_name": tool_name,
+                "file_path": file_path,
+                "lines_written": lines_written,
+                "lines_edited": lines_edited,
+                "lines_deleted": lines_deleted,
+                "net_lines": net_lines,
+            }],
+        }
+
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(f"{LOC_SERVICE_URL}/loc/track", json=batch)
+    except Exception as e:
+        logger.debug(f"LOC tracking failed (non-critical): {e}")
+
 
 # ── Session store ──
 
@@ -153,6 +226,11 @@ def _build_tool_definitions() -> List[Dict[str, Any]]:
         {"type": F, "function": {"name": "code_visualizer_pipeline", "description": "Auto-detected pipeline flow.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "pipeline_name": {"type": "string"}}, "required": ["path", "pipeline_name"]}}},
         {"type": F, "function": {"name": "code_visualizer_filter", "description": "Filter graph by file, type, keyword.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "file_path": {"type": "string"}, "node_type": {"type": "string"}, "keyword": {"type": "string"}}, "required": ["path"]}}},
         {"type": F, "function": {"name": "code_visualizer_by_type", "description": "Get all nodes of a type.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "node_type": {"type": "string"}}, "required": ["path", "node_type"]}}},
+        {"type": F, "function": {"name": "code_visualizer_compare", "description": "Compare multiple codebases — detect changes, instability, evolution.", "parameters": {"type": "object", "properties": {"paths": {"type": "string", "description": "Comma-separated paths to compare"}, "labels": {"type": "string", "description": "Comma-separated labels for each path"}}, "required": ["paths"]}}},
+        {"type": F, "function": {"name": "code_visualizer_live_nodes", "description": "List live (reachable) nodes in the dependency graph.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "drift_threshold": {"type": "number"}}, "required": ["path"]}}},
+        {"type": F, "function": {"name": "code_visualizer_invalid_nodes", "description": "List invalid/unreachable nodes (dead code candidates).", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "drift_threshold": {"type": "number"}}, "required": ["path"]}}},
+        {"type": F, "function": {"name": "code_visualizer_compile", "description": "Graph→Patch Compiler: convert GAL action to auditable code patch.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "gal_action": {"type": "string", "description": "JSON GAL action object"}}, "required": ["path", "gal_action"]}}},
+        {"type": F, "function": {"name": "code_visualizer_verify_invariants", "description": "Verify formal safety invariants on the codebase graph.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
         {"type": F, "function": {"name": "code_visualizer_scan_github", "description": "AST-scan a GitHub repository by URL. Clones and analyzes remotely — no local checkout needed. Supports branch selection and private repos with token.", "parameters": {"type": "object", "properties": {"repo_url": {"type": "string", "description": "GitHub repository URL (e.g. https://github.com/user/repo)"}, "branch": {"type": "string", "description": "Branch to scan (default: main/master)"}, "token": {"type": "string", "description": "GitHub PAT for private repos (optional)"}}, "required": ["repo_url"]}}},
     ])
 
@@ -727,6 +805,16 @@ async def agent_stream(
                         tool_result = tool_result_data.get("result", "{}")
                         is_error = '"error"' in tool_result
                         yield f"event: tool_done\ndata: {json.dumps({'tool_call_id': tc_id, 'name': tc_name, 'status': 'error' if is_error else 'ok'})}\n\n"
+
+                    # Track LOC for file write/edit tools (fire-and-forget)
+                    if tc_name in _FILE_WRITE_TOOLS and not is_error:
+                        asyncio.ensure_future(_track_loc_event(
+                            user_id=user_id,
+                            session_id=session.id,
+                            tool_name=tc_name,
+                            tool_args=tc_args,
+                            tool_result=tool_result,
+                        ))
 
                     messages.append({
                         "role": "assistant",
