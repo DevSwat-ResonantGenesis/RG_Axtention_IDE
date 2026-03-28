@@ -311,7 +311,7 @@ def _select_tools(query: str) -> List[Dict[str, Any]]:
         names |= _GIT_NAMES
     if re.search(r'\b(http|url|web|search|browse|fetch|download|api|endpoint|curl)\b', q) or '://' in q:
         names |= _WEB_NAMES
-    if re.search(r'\b(analy[sz]|visuali[sz]|architecture|structure|dependen|scan|overview|governance|dead.?code|pipeline|graph.?janitor|drift|trace.?flow|codebase|ast|github\.com|repo)', q) or 'github.com/' in q:
+    if re.search(r'\b(analy[sz]|visuali[sz]|architecture|structure|dependen|scan|overview|governance|dead.?code|pipeline|graph.?janitor|drift|trace.?flow|codebase|ast|github\.com|repo|unused|orphan|unreachable|cleanup|clean.?up|code.?health|health.?check|code.?quality|code.?review|remove.?dead|find.?dead|what.?can.?i.?delete|janitor|reachab)', q) or 'github.com/' in q:
         names |= _VIZ_NAMES
     if re.search(r'\b(plan|todo|task|step|remember|memory|save|note)\b', q):
         names |= _PLAN_NAMES
@@ -412,7 +412,8 @@ Give it a path or URL and it handles everything: AST scan → governance analysi
 - GITHUB repos: use graph_janitor_scan_github with the repo URL. One call does everything (scans + analyzes + proposes).
 - NEVER tell the user to "first scan, then run janitor". The janitor IS the scanner + analyzer + proposer combined.
 - Returns: health score, reachability %, unreachable/isolated/orphan counts, and ranked cleanup proposals.
-- When user mentions "janitor", "cleanup", "dead code", "reachability", "graph health", "autonomous agent" → call graph_janitor_scan immediately.
+- Trigger on ANY intent related to code cleanup: "find unused code", "what can I delete", "are there dead routes", "code quality check", "health audit", "orphan files", "unreachable functions", "cleanup suggestions", "autonomous agent", "janitor", "dead code" etc.
+- If the user asks anything about code quality, unused code, or cleanup → call graph_janitor_scan immediately. Don't wait for exact keywords.
 - Present results as actionable insights: health status, which nodes are dead, which endpoints are orphaned, what actions the agent proposes and why.
 
 You are Resonant AI by Resonant Genesis. Not GPT, Claude, or Llama."""
