@@ -959,6 +959,12 @@ async def agent_stream(
                         logger.info(f"Executing server-side tool: {tc_name} args={json.dumps(tc_args)[:200]}")
                         tool_result = await _execute_server_side_tool(tc_name, tc_args)
                         is_error = '"error"' in tool_result
+                        # Stream tool result preview to client so user sees server-side output
+                        try:
+                            preview = tool_result[:4000] if len(tool_result) > 4000 else tool_result
+                            yield f"event: tool_output\ndata: {json.dumps({'tool_call_id': tc_id, 'name': tc_name, 'preview': preview})}\n\n"
+                        except Exception:
+                            pass
                         yield f"event: tool_done\ndata: {json.dumps({'tool_call_id': tc_id, 'name': tc_name, 'status': 'error' if is_error else 'ok'})}\n\n"
                     else:
                         # Client-side tools: send to client, wait for result
@@ -1012,6 +1018,10 @@ async def agent_stream(
                     recent = messages[-20:]
                     messages = [system] + recent
                     _compress_old_messages(messages)
+
+                # Emit loop progress so client sees reasoning between loops
+                if loops < max_loops:
+                    yield f"event: thinking\ndata: {json.dumps({'message': f'Analyzing results... (loop {loops}, {total_tool_calls} tools used)'})}\n\n"
 
             # ── Done ──
             yield f"event: stats\ndata: {json.dumps({'loops': loops, 'tool_calls': total_tool_calls, 'tokens': total_tokens, 'provider': last_provider, 'model': last_model, 'fallback_chain': fallback_chain})}\n\n"
