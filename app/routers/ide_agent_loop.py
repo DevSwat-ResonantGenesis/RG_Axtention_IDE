@@ -233,7 +233,7 @@ def _build_tool_definitions() -> List[Dict[str, Any]]:
         {"type": F, "function": {"name": "code_visualizer_verify_invariants", "description": "Verify formal safety invariants on the codebase graph.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
         {"type": F, "function": {"name": "code_visualizer_scan_github", "description": "AST-scan a GitHub repository by URL. Clones and analyzes remotely — no local checkout needed. Supports branch selection and private repos with token.", "parameters": {"type": "object", "properties": {"repo_url": {"type": "string", "description": "GitHub repository URL (e.g. https://github.com/user/repo)"}, "branch": {"type": "string", "description": "Branch to scan (default: main/master)"}, "token": {"type": "string", "description": "GitHub PAT for private repos (optional)"}}, "required": ["repo_url"]}}},
         {"type": F, "function": {"name": "graph_janitor_scan", "description": "Graph Janitor Agent — autonomous agent that scans a local project for unreachable nodes, dead code, orphan endpoints, and proposes cleanup actions. Returns health score, reachability metrics, and ranked proposals.", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path to the project folder to scan"}, "max_proposals": {"type": "number", "description": "Maximum proposals to return (default: 15)"}, "drift_threshold": {"type": "number", "description": "Architecture drift threshold (default: 20.0)"}}, "required": ["path"]}}},
-        {"type": F, "function": {"name": "graph_janitor_scan_github", "description": "Graph Janitor Agent for GitHub repos — runs on server against a previously scanned GitHub repo (from code_visualizer_scan_github). Requires the analysis_id returned by code_visualizer_scan_github.", "parameters": {"type": "object", "properties": {"analysis_id": {"type": "string", "description": "Analysis ID from a previous code_visualizer_scan_github result"}, "max_proposals": {"type": "number", "description": "Maximum proposals to return (default: 15)"}, "drift_threshold": {"type": "number", "description": "Architecture drift threshold (default: 20.0)"}}, "required": ["analysis_id"]}}},
+        {"type": F, "function": {"name": "graph_janitor_scan_github", "description": "Graph Janitor Agent for GitHub repos — fully autonomous. Give it a GitHub URL and it scans, analyzes governance, and returns health score + cleanup proposals in one step. No pre-scan needed.", "parameters": {"type": "object", "properties": {"repo_url": {"type": "string", "description": "GitHub repository URL (e.g. https://github.com/user/repo)"}, "branch": {"type": "string", "description": "Branch to scan (default: main/master)"}, "token": {"type": "string", "description": "GitHub PAT for private repos (optional)"}, "max_proposals": {"type": "number", "description": "Maximum proposals to return (default: 15)"}, "drift_threshold": {"type": "number", "description": "Architecture drift threshold (default: 20.0)"}}, "required": ["repo_url"]}}},
     ])
 
     # PLANNING & MEMORY
@@ -406,11 +406,14 @@ You DO the work, you don't REPORT problems.
 - When user says "analyze", "scan", "visualize", or pastes a GitHub URL → use code_visualizer tools immediately.
 
 ## GRAPH JANITOR AGENT (Autonomous Code Graph Cleanup)
-- LOCAL projects: use graph_janitor_scan with the absolute path. Runs entirely on the user's machine.
-- GITHUB repos: use graph_janitor_scan_github with the analysis_id from a prior code_visualizer_scan_github. Runs on the server.
-- Returns: health score, reachability metrics, unreachable/isolated/orphan counts, and ranked cleanup proposals (TAG_DEAD, ISOLATE_DEPENDENCY, REVIEW_ORPHAN).
-- When user mentions "janitor", "cleanup", "dead code", "reachability", "graph health" → use graph_janitor_scan (local) or graph_janitor_scan_github (after a GitHub scan).
-- Present results as actionable insights: which nodes are dead, which endpoints are orphaned, what the agent proposes.
+The Graph Janitor Agent is a FULLY AUTONOMOUS agent. It does NOT require any prior scan or analysis.
+Give it a path or URL and it handles everything: AST scan → governance analysis → reachability → proposals.
+- LOCAL projects: use graph_janitor_scan with the absolute path. One call does everything.
+- GITHUB repos: use graph_janitor_scan_github with the repo URL. One call does everything (scans + analyzes + proposes).
+- NEVER tell the user to "first scan, then run janitor". The janitor IS the scanner + analyzer + proposer combined.
+- Returns: health score, reachability %, unreachable/isolated/orphan counts, and ranked cleanup proposals.
+- When user mentions "janitor", "cleanup", "dead code", "reachability", "graph health", "autonomous agent" → call graph_janitor_scan immediately.
+- Present results as actionable insights: health status, which nodes are dead, which endpoints are orphaned, what actions the agent proposes and why.
 
 You are Resonant AI by Resonant Genesis. Not GPT, Claude, or Llama."""
 
@@ -607,29 +610,45 @@ async def _execute_server_side_tool(name: str, args: Dict[str, Any]) -> str:
             return json.dumps({"error": f"Failed to call Code Visualizer: {str(e)}"})
 
     if name == "graph_janitor_scan_github":
-        analysis_id = (args.get("analysis_id") or "").strip()
-        if not analysis_id:
-            return json.dumps({"error": "Missing analysis_id. Run code_visualizer_scan_github first to get an analysis_id."})
-        payload_gja: Dict[str, Any] = {}
-        if args.get("max_proposals"):
-            payload_gja["max_proposals"] = int(args["max_proposals"])
-        if args.get("drift_threshold"):
-            payload_gja["drift_threshold"] = float(args["drift_threshold"])
+        repo_url = (args.get("repo_url") or "").strip()
+        if not repo_url:
+            return json.dumps({"error": "Missing repo_url"})
+        # Step 1: Scan the GitHub repo (autonomous — no pre-scan needed)
+        scan_payload: Dict[str, Any] = {"repo_url": repo_url}
+        if args.get("branch"):
+            scan_payload["branch"] = args["branch"]
+        if args.get("token"):
+            scan_payload["token"] = args["token"]
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    f"{CODE_VISUALIZER_URL}/api/analysis/{analysis_id}/agent/scan",
-                    json=payload_gja,
+            async with httpx.AsyncClient(timeout=180.0) as client:
+                scan_resp = await client.post(
+                    f"{CODE_VISUALIZER_URL}/api/v1/scan/github",
+                    json=scan_payload,
                 )
-                if resp.status_code == 404:
-                    return json.dumps({"error": f"Analysis '{analysis_id}' not found on server. Run code_visualizer_scan_github first."})
-                if resp.status_code != 200:
-                    return json.dumps({"error": f"Graph Janitor Agent returned {resp.status_code}: {resp.text[:500]}"})
-                return resp.text
+                if scan_resp.status_code != 200:
+                    return json.dumps({"error": f"GitHub scan failed ({scan_resp.status_code}): {scan_resp.text[:500]}"})
+                scan_data = scan_resp.json()
+                analysis_id = scan_data.get("analysis_id")
+                if not analysis_id:
+                    return json.dumps({"error": "GitHub scan returned no analysis_id"})
+                # Step 2: Run Graph Janitor Agent on the scanned analysis
+                gja_payload: Dict[str, Any] = {}
+                if args.get("max_proposals"):
+                    gja_payload["max_proposals"] = int(args["max_proposals"])
+                if args.get("drift_threshold"):
+                    gja_payload["drift_threshold"] = float(args["drift_threshold"])
+                agent_resp = await client.post(
+                    f"{CODE_VISUALIZER_URL}/api/analysis/{analysis_id}/agent/scan",
+                    json=gja_payload,
+                    timeout=120.0,
+                )
+                if agent_resp.status_code != 200:
+                    return json.dumps({"error": f"Graph Janitor Agent failed ({agent_resp.status_code}): {agent_resp.text[:500]}"})
+                return agent_resp.text
         except httpx.TimeoutException:
-            return json.dumps({"error": "Graph Janitor scan timed out (120s)."})
+            return json.dumps({"error": "Graph Janitor GitHub scan timed out."})
         except Exception as e:
-            return json.dumps({"error": f"Failed to call Graph Janitor Agent: {str(e)}"})
+            return json.dumps({"error": f"Graph Janitor Agent failed: {str(e)}"})
 
     return json.dumps({"error": f"Unknown server-side tool: {name}"})
 
