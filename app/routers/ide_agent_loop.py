@@ -175,6 +175,7 @@ class AgentSession:
         self.user_id = user_id
         self.workspace_root = workspace_root
         self.tool_result_queue: asyncio.Queue = asyncio.Queue()
+        self.llm_result_queue: asyncio.Queue = asyncio.Queue()  # LLM proxy for local Ollama
         self.created_at = time.time()
         self.last_activity = time.time()
         self.active = True
@@ -221,6 +222,15 @@ class ToolResultRequest(BaseModel):
     tool_call_id: str
     name: str
     result: str
+
+
+class LLMResultRequest(BaseModel):
+    """Client posts local LLM (Ollama) completion result back to server."""
+    content: str = ""
+    tool_calls: Optional[List[Dict[str, Any]]] = None  # [{id, type, function: {name, arguments}}]
+    usage: Optional[Dict[str, Any]] = None  # {prompt_tokens, completion_tokens, total_tokens}
+    model: str = ""
+    error: Optional[str] = None
 
 
 # ── Tool definitions (protected server-side IP) ──
@@ -839,55 +849,98 @@ async def agent_stream(
                 # Force tool use on first loop so agent investigates before talking
                 loop_tool_choice = "required" if loops == 1 and tools else "auto"
 
-                try:
-                    async for chunk in call_llm_streaming(
-                        messages=messages,
-                        preferred_provider=provider_key,
-                        preferred_model=model_name,
-                        user_keys=user_keys,
-                        tools=tools,
-                        tool_choice=loop_tool_choice,
-                        temperature=0.7,
-                        max_tokens=16384,
-                        local_llm=request_body.local_llm,
-                    ):
-                        if chunk.event == "chunk":
-                            if chunk.content:
-                                content += chunk.content
-                                yield f"event: text\ndata: {json.dumps({'content': chunk.content})}\n\n"
+                use_ollama_proxy = (provider_key == "ollama" and request_body.local_llm is not None)
+                llm_done = False
 
-                        elif chunk.event == "fallback":
-                            fallback_attempt += 1
-                            fb_info = {'provider': chunk.provider, 'model': chunk.model, 'attempt': fallback_attempt}
-                            loop_fallback_chain.append(fb_info)
-                            yield f"event: fallback\ndata: {json.dumps(fb_info)}\n\n"
+                # ── Local Ollama via client-side proxy ──
+                # Server can't reach user's localhost — send request to client,
+                # client calls Ollama locally, streams text to UI, POSTs result back.
+                if use_ollama_proxy:
+                    ollama_cfg = request_body.local_llm or {}
+                    llm_req = {
+                        "session_id": session.id,
+                        "messages": messages,
+                        "tools": tools,
+                        "tool_choice": loop_tool_choice,
+                        "temperature": 0.7,
+                        "max_tokens": min(16384, ollama_cfg.get("context_length", 32768)),
+                        "model": ollama_cfg.get("model", model_name),
+                        "url": ollama_cfg.get("url", "http://localhost:11434"),
+                    }
+                    yield f"event: llm_proxy_request\ndata: {json.dumps(llm_req)}\n\n"
+                    try:
+                        llm_result = await asyncio.wait_for(
+                            session.llm_result_queue.get(), timeout=300,
+                        )
+                        if llm_result.get("error"):
+                            logger.warning(f"Local Ollama proxy failed: {llm_result['error']}, falling back to cloud...")
+                            yield f"event: text\ndata: {json.dumps({'content': chr(10) + '> ⚠️ Local LLM failed: ' + str(llm_result['error'])[:100] + ' — falling back to cloud...' + chr(10)})}\n\n"
+                        else:
+                            content = llm_result.get("content", "")
+                            tool_calls = llm_result.get("tool_calls") or []
+                            usage = llm_result.get("usage") or {}
+                            if usage:
+                                total_tokens += usage.get("total_tokens", 0) or (usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0))
+                            last_provider = "ollama"
+                            last_model = llm_result.get("model", model_name)
+                            llm_done = True
+                    except asyncio.TimeoutError:
+                        logger.warning("Local Ollama proxy timed out (300s), falling back to cloud...")
+                        yield f"event: text\ndata: {json.dumps({'content': chr(10) + '> ⚠️ Local LLM timed out — falling back to cloud...' + chr(10)})}\n\n"
 
-                        elif chunk.event == "tool_calls":
-                            tool_calls = chunk.tool_calls or []
+                # ── Cloud provider call (primary or fallback from Ollama) ──
+                if not llm_done:
+                    cloud_provider = provider_key if provider_key != "ollama" else "openai"
+                    cloud_model = model_name if provider_key != "ollama" else "gpt-4o"
+                    try:
+                        async for chunk in call_llm_streaming(
+                            messages=messages,
+                            preferred_provider=cloud_provider,
+                            preferred_model=cloud_model,
+                            user_keys=user_keys,
+                            tools=tools,
+                            tool_choice=loop_tool_choice,
+                            temperature=0.7,
+                            max_tokens=16384,
+                            local_llm=None,
+                        ):
+                            if chunk.event == "chunk":
+                                if chunk.content:
+                                    content += chunk.content
+                                    yield f"event: text\ndata: {json.dumps({'content': chunk.content})}\n\n"
 
-                        elif chunk.event == "done":
-                            if chunk.usage:
-                                u = chunk.usage
-                                total_tokens += u.get("total_tokens", 0) or (u.get("prompt_tokens", 0) + u.get("completion_tokens", 0))
-                            last_provider = chunk.provider or provider_key
-                            last_model = chunk.model or model_name
-                            if loop_fallback_chain:
-                                fallback_chain.extend(loop_fallback_chain)
+                            elif chunk.event == "fallback":
+                                fallback_attempt += 1
+                                fb_info = {'provider': chunk.provider, 'model': chunk.model, 'attempt': fallback_attempt}
+                                loop_fallback_chain.append(fb_info)
+                                yield f"event: fallback\ndata: {json.dumps(fb_info)}\n\n"
 
-                        elif chunk.event == "error":
-                            yield f"event: error\ndata: {json.dumps({'error': chunk.error})}\n\n"
-                            return
+                            elif chunk.event == "tool_calls":
+                                tool_calls = chunk.tool_calls or []
 
-                except Exception as e:
-                    err_msg = str(e)
-                    if "429" in err_msg and loops < max_loops:
-                        wait = min(loops * 20, 60)
-                        rate_msg = "\n> ⏳ Rate limit hit — waiting " + str(wait) + "s...\n"
-                        yield f"event: text\ndata: {json.dumps({'content': rate_msg})}\n\n"
-                        await asyncio.sleep(wait)
-                        continue
-                    yield f"event: error\ndata: {json.dumps({'error': err_msg})}\n\n"
-                    return
+                            elif chunk.event == "done":
+                                if chunk.usage:
+                                    u = chunk.usage
+                                    total_tokens += u.get("total_tokens", 0) or (u.get("prompt_tokens", 0) + u.get("completion_tokens", 0))
+                                last_provider = chunk.provider or cloud_provider
+                                last_model = chunk.model or cloud_model
+                                if loop_fallback_chain:
+                                    fallback_chain.extend(loop_fallback_chain)
+
+                            elif chunk.event == "error":
+                                yield f"event: error\ndata: {json.dumps({'error': chunk.error})}\n\n"
+                                return
+
+                    except Exception as e:
+                        err_msg = str(e)
+                        if "429" in err_msg and loops < max_loops:
+                            wait = min(loops * 20, 60)
+                            rate_msg = "\n> ⏳ Rate limit hit — waiting " + str(wait) + "s...\n"
+                            yield f"event: text\ndata: {json.dumps({'content': rate_msg})}\n\n"
+                            await asyncio.sleep(wait)
+                            continue
+                        yield f"event: error\ndata: {json.dumps({'error': err_msg})}\n\n"
+                        return
 
                 logger.info(f"Loop {loops}: provider={last_provider} content_len={len(content)} tool_calls={len(tool_calls)} tools_in_request={len(tools)} tool_choice={loop_tool_choice}")
 
@@ -898,43 +951,77 @@ async def agent_stream(
                     tool_calls = []
                     fallback_attempt = 0
                     loop_fallback_chain = []
-                    try:
-                        async for chunk in call_llm_streaming(
-                            messages=messages,
-                            preferred_provider=provider_key,
-                            preferred_model=model_name,
-                            user_keys=user_keys,
-                            tools=tools,
-                            tool_choice="auto",
-                            temperature=0.7,
-                            max_tokens=16384,
-                            local_llm=request_body.local_llm,
-                        ):
-                            if chunk.event == "chunk":
-                                if chunk.content:
-                                    content += chunk.content
-                                    yield f"event: text\ndata: {json.dumps({'content': chunk.content})}\n\n"
-                            elif chunk.event == "fallback":
-                                fallback_attempt += 1
-                                fb_info = {'provider': chunk.provider, 'model': chunk.model, 'attempt': fallback_attempt}
-                                loop_fallback_chain.append(fb_info)
-                                yield f"event: fallback\ndata: {json.dumps(fb_info)}\n\n"
-                            elif chunk.event == "tool_calls":
-                                tool_calls = chunk.tool_calls or []
-                            elif chunk.event == "done":
-                                if chunk.usage:
-                                    u = chunk.usage
-                                    total_tokens += u.get("total_tokens", 0) or (u.get("prompt_tokens", 0) + u.get("completion_tokens", 0))
-                                last_provider = chunk.provider or provider_key
-                                last_model = chunk.model or model_name
-                                if loop_fallback_chain:
-                                    fallback_chain.extend(loop_fallback_chain)
-                            elif chunk.event == "error":
-                                yield f"event: error\ndata: {json.dumps({'error': chunk.error})}\n\n"
-                                return
-                    except Exception as e:
-                        yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
-                        return
+                    llm_done = False
+
+                    if use_ollama_proxy:
+                        ollama_cfg = request_body.local_llm or {}
+                        llm_req = {
+                            "session_id": session.id,
+                            "messages": messages,
+                            "tools": tools,
+                            "tool_choice": "auto",
+                            "temperature": 0.7,
+                            "max_tokens": min(16384, ollama_cfg.get("context_length", 32768)),
+                            "model": ollama_cfg.get("model", model_name),
+                            "url": ollama_cfg.get("url", "http://localhost:11434"),
+                        }
+                        yield f"event: llm_proxy_request\ndata: {json.dumps(llm_req)}\n\n"
+                        try:
+                            llm_result = await asyncio.wait_for(
+                                session.llm_result_queue.get(), timeout=300,
+                            )
+                            if not llm_result.get("error"):
+                                content = llm_result.get("content", "")
+                                tool_calls = llm_result.get("tool_calls") or []
+                                usage = llm_result.get("usage") or {}
+                                if usage:
+                                    total_tokens += usage.get("total_tokens", 0) or (usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0))
+                                last_provider = "ollama"
+                                last_model = llm_result.get("model", model_name)
+                                llm_done = True
+                        except asyncio.TimeoutError:
+                            pass
+
+                    if not llm_done:
+                        cloud_provider = provider_key if provider_key != "ollama" else "openai"
+                        cloud_model = model_name if provider_key != "ollama" else "gpt-4o"
+                        try:
+                            async for chunk in call_llm_streaming(
+                                messages=messages,
+                                preferred_provider=cloud_provider,
+                                preferred_model=cloud_model,
+                                user_keys=user_keys,
+                                tools=tools,
+                                tool_choice="auto",
+                                temperature=0.7,
+                                max_tokens=16384,
+                                local_llm=None,
+                            ):
+                                if chunk.event == "chunk":
+                                    if chunk.content:
+                                        content += chunk.content
+                                        yield f"event: text\ndata: {json.dumps({'content': chunk.content})}\n\n"
+                                elif chunk.event == "fallback":
+                                    fallback_attempt += 1
+                                    fb_info = {'provider': chunk.provider, 'model': chunk.model, 'attempt': fallback_attempt}
+                                    loop_fallback_chain.append(fb_info)
+                                    yield f"event: fallback\ndata: {json.dumps(fb_info)}\n\n"
+                                elif chunk.event == "tool_calls":
+                                    tool_calls = chunk.tool_calls or []
+                                elif chunk.event == "done":
+                                    if chunk.usage:
+                                        u = chunk.usage
+                                        total_tokens += u.get("total_tokens", 0) or (u.get("prompt_tokens", 0) + u.get("completion_tokens", 0))
+                                    last_provider = chunk.provider or cloud_provider
+                                    last_model = chunk.model or cloud_model
+                                    if loop_fallback_chain:
+                                        fallback_chain.extend(loop_fallback_chain)
+                                elif chunk.event == "error":
+                                    yield f"event: error\ndata: {json.dumps({'error': chunk.error})}\n\n"
+                                    return
+                        except Exception as e:
+                            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+                            return
                     logger.info(f"Loop {loops} (retry auto): content_len={len(content)} tool_calls={len(tool_calls)}")
 
                 if not tool_calls:
@@ -1064,6 +1151,32 @@ async def submit_tool_results(
         "tool_call_id": request_body.tool_call_id,
         "name": request_body.name,
         "result": request_body.result,
+    })
+
+    return {"status": "ok", "session_id": session_id}
+
+
+@router.post("/agent-stream/{session_id}/llm-result")
+async def submit_llm_result(
+    session_id: str,
+    request_body: LLMResultRequest,
+    request: Request,
+):
+    """Client submits local LLM (Ollama) completion result. Server resumes agentic loop."""
+    auth_header = request.headers.get("authorization", "")
+    auth_token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
+    user_id = request.headers.get("x-user-id") or auth_token[:20] or ""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    session = _get_or_fail(session_id)
+
+    await session.llm_result_queue.put({
+        "content": request_body.content,
+        "tool_calls": request_body.tool_calls or [],
+        "usage": request_body.usage or {},
+        "model": request_body.model,
+        "error": request_body.error,
     })
 
     return {"status": "ok", "session_id": session_id}
