@@ -1127,8 +1127,17 @@ async def agent_stream(
 
                 if len(messages) > 22:
                     system = messages[0]
+                    # Always preserve the user's original request (first user message after system + context)
+                    user_msg = None
+                    for m in messages[1:]:
+                        if m.get("role") == "user":
+                            user_msg = m
+                            break
                     recent = messages[-20:]
                     messages = [system] + recent
+                    # Re-inject original user request right after system if it was dropped
+                    if user_msg and user_msg not in recent:
+                        messages.insert(1, user_msg)
                     _compress_old_messages(messages)
 
                 # Emit loop progress so client sees reasoning between loops
