@@ -8,6 +8,7 @@ Endpoints:
   POST /api/v1/ide/agent-stream           — Full agentic loop (SSE)
   POST /api/v1/ide/agent-stream/{sid}/tool-results — Client posts tool results
   POST /api/v1/ide/completions            — Single-turn LLM proxy (SSE)
+  GET  /api/v1/ide/providers              — Live provider status (rg_llm)
   GET  /health                            — Health check
 """
 from __future__ import annotations
@@ -17,7 +18,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from .routers import ide_agent_loop_router, ide_completions_router
+from .routers import ide_agent_loop_router, ide_completions_router, ide_providers_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -41,6 +42,7 @@ app.add_middleware(
 # Mount routers under /api/v1
 app.include_router(ide_agent_loop_router, prefix="/api/v1")
 app.include_router(ide_completions_router, prefix="/api/v1")
+app.include_router(ide_providers_router, prefix="/api/v1")
 
 
 @app.get("/health")

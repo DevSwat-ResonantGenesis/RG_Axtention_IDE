@@ -855,8 +855,8 @@ async def agent_stream(
     user_keys = await fetch_user_byok_keys(user_id, auth_token)
 
     # Parse model selection from "resonant-{provider}-{model}"
-    provider_key = "groq"
-    model_name = "llama-3.3-70b-versatile"
+    provider_key = ""
+    model_name = ""
     if request_body.model_id and request_body.model_id.startswith("resonant-"):
         parts = request_body.model_id.replace("resonant-", "", 1).split("-", 1)
         if len(parts) == 2:
