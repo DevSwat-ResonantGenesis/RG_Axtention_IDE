@@ -668,7 +668,7 @@ def _summarize_gja_result(raw: str) -> str:
     return "\n".join(lines)
 
 
-def _summarize_tool_result(name: str, raw: str, cap: int = 3000) -> str:
+def _summarize_tool_result(name: str, raw: str, cap: int = 1500) -> str:
     # Code Visualizer tools get special treatment — much higher cap + smart summarization
     if name.startswith("code_visualizer_"):
         return _summarize_cv_result(name, raw)
@@ -691,10 +691,10 @@ def _summarize_tool_result(name: str, raw: str, cap: int = 3000) -> str:
 
 
 def _compress_old_messages(msgs: List[Dict[str, Any]]) -> None:
-    cutoff = len(msgs) - 6
+    cutoff = len(msgs) - 4
     for i in range(1, cutoff):
         m = msgs[i]
-        if m.get("role") == "tool" and isinstance(m.get("content"), str) and len(m["content"]) > 200:
+        if m.get("role") == "tool" and isinstance(m.get("content"), str) and len(m["content"]) > 150:
             # Preserve code_visualizer results better — keep 2000 chars instead of wiping
             if m.get("name", "").startswith("code_visualizer_"):
                 if len(m["content"]) > 2000:
