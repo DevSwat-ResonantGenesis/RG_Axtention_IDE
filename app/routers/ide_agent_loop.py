@@ -964,12 +964,11 @@ async def agent_stream(
                 logger.info(f"Loop {loops}: provider={last_provider} content_len={len(content)} tool_calls={len(tool_calls)} tools_in_request={len(tools)} tool_choice={loop_tool_choice}")
 
                 # Anti-lazy: if first loop returned text but NO tool calls, model is being careless
-                # Force a retry with explicit instruction to use tools
+                # Force a retry with explicit instruction to use tools (use system role, not user, to avoid confusing context)
                 if loops == 1 and not tool_calls and content and len(content.strip()) > 50:
                     logger.warning(f"Loop 1: model returned {len(content)} chars text but 0 tool calls — injecting tool reminder")
-                    # Save the text but add a system nudge
                     messages.append({"role": "assistant", "content": content})
-                    messages.append({"role": "user", "content": "You responded with text only. Use tools to actually investigate. Run commands, read files, or search the codebase. Do not just describe what you would do — do it now."})
+                    messages.append({"role": "system", "content": "[SYSTEM] You responded with text only. You MUST use tools to investigate. Run commands, read files, or search the codebase. Do not describe what you would do — do it now."})
                     content = ""
                     continue
 
