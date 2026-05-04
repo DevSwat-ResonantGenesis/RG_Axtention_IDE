@@ -112,57 +112,6 @@ async def _track_loc_event(
         logger.debug(f"LOC tracking failed (non-critical): {e}")
 
 
-# ── Workspace health cache (background janitor scan results) ──
-
-_HEALTH_CACHE_TTL = 600  # 10 min
-_workspace_health: Dict[str, Dict[str, Any]] = {}  # workspace_root -> {"data": ..., "ts": ...}
-
-
-def _get_cached_health(workspace_root: str) -> Optional[str]:
-    """Return cached janitor summary if fresh, else None."""
-    entry = _workspace_health.get(workspace_root)
-    if not entry:
-        return None
-    if time.time() - entry["ts"] > _HEALTH_CACHE_TTL:
-        _workspace_health.pop(workspace_root, None)
-        return None
-    return entry.get("summary", "")
-
-
-def _cache_health(workspace_root: str, raw_json: str):
-    """Parse janitor result and cache a compact summary."""
-    try:
-        d = json.loads(raw_json)
-    except Exception:
-        return
-    hi = d.get("health_indicators") or {}
-    m = d.get("metrics") or {}
-    proposals = d.get("proposals") or []
-    status = hi.get("status", "unknown")
-    emoji = hi.get("status_emoji", "")
-    score = hi.get("health_score", "?")
-    reach = m.get("reachability_score", "?")
-    unreach = m.get("unreachable_nodes", 0)
-    isolated = m.get("isolated_nodes", 0)
-    orphans = m.get("orphan_endpoints", 0)
-    total = m.get("total_nodes", 0)
-
-    lines = [f"Health: {emoji} {status} (score {score}/100)"]
-    lines.append(f"Reachability: {reach}% | Nodes: {total} | Unreachable: {unreach} | Isolated: {isolated} | Orphan endpoints: {orphans}")
-    if proposals:
-        lines.append(f"Top proposals ({len(proposals)}):")
-        for p in proposals[:5]:
-            lines.append(f"  - [{p.get('proposal','')}] {p.get('root','')} — {p.get('reason','')}")
-    recs = hi.get("recommendations") or []
-    if recs:
-        lines.append("Recommendations: " + "; ".join(recs[:3]))
-
-    _workspace_health[workspace_root] = {
-        "summary": "\n".join(lines),
-        "ts": time.time(),
-    }
-
-
 # ── Session store ──
 
 SESSION_TIMEOUT = 300  # 5 min
@@ -406,7 +355,7 @@ def _select_tools(query: str) -> List[Dict[str, Any]]:
     if re.search(r'\b(platform|api|endpoint|agent|team|workflow|billing|blockchain|marketplace|invariant|simulation|hash.?sphere)\b', q):
         names |= _PLAT_NAMES
     if len(q) > 200 or re.search(r'\b(build|create|implement|refactor|fix.*bug|debug)\b', q):
-        names |= _PLAN_NAMES | _VIZ_NAMES
+        names |= _PLAN_NAMES
 
     return [t for t in _ALL_TOOLS if t["function"]["name"] in names]
 
@@ -416,16 +365,10 @@ def _select_tools(query: str) -> List[Dict[str, Any]]:
 def _build_system_prompt(
     workspace_root: str,
     active_file: Optional[str] = None,
-    health_context: Optional[str] = None,
     ide_metadata: Optional[Dict[str, Any]] = None,
     workspace_layout: Optional[str] = None,
 ) -> str:
     health_block = ""
-    if health_context:
-        health_block = f"""
-<workspace_health>
-{health_context}
-</workspace_health>"""
 
     # IDE metadata block (like Cascade's ide_metadata injection)
     ide_block = ""
@@ -572,13 +515,20 @@ Format: YAML frontmatter (description) + markdown steps.
 </workflows>
 
 <memory_system>
-You have access to a persistent memory database:
-- create_memory: store important context (user preferences, decisions, architecture notes, project structure, technical stacks).
-- save_memory / read_memory: key-value store with semantic search.
-- Before creating a new memory, check if a semantically related memory already exists. If found, update it instead of creating a duplicate.
-- Memories are auto-retrieved when relevant. Update stale memories, delete incorrect ones.
-- Remember that memories can be stale or incorrect. Always verify their relevance and accuracy before using them.
+You have access to a persistent memory database backed by Hash Sphere (server-side vector store):
+- read_memory(query=...): Semantic search across all saved memories. USE THIS at the start of complex tasks to check for prior context, decisions, architecture notes, or user preferences.
+- save_memory(key, content, tags): Store important context for future sessions.
+- create_memory(action, title, content, tags, id): CRUD operations on memories.
+- Before creating a new memory, use read_memory to check if a related memory already exists. Update it instead of creating a duplicate.
+- Memories persist across sessions. At the start of significant work, proactively call read_memory with a relevant query to retrieve prior context.
+- After completing significant work (architecture decisions, major refactors, debugging sessions), save a memory summarizing what was done and why.
+- Memories can be stale or incorrect. Always verify their relevance before relying on them.
 </memory_system>
+
+<workspace_context>
+- You have code analysis tools (code_visualizer_*, graph_janitor_*) available. Use them ONLY when the user asks for architecture analysis, dead code detection, health checks, or when you genuinely need codebase-wide understanding. Do NOT auto-scan on every interaction.
+- For normal coding tasks (fix bug, write feature, read file), use core tools (file_read, grep_search, run_command) — they are faster and cheaper.
+</workspace_context>
 
 You are DevSwat AI by DevSwat.{health_block}"""
 
@@ -876,34 +826,9 @@ async def agent_stream(
 
     async def generate():
         try:
-            # ── Pre-flight: background janitor scan ──
-            cached_health = _get_cached_health(request_body.workspace_root)
-            preflight_ran = False
-
-            if not cached_health and request_body.workspace_root:
-                # No cached health — run graph_janitor_scan as automatic pre-flight
-                yield f"event: thinking\ndata: {json.dumps({'message': 'Scanning workspace health...'})}\n\n"
-                preflight_tc_id = f"preflight_{session.id}"
-                yield f"event: execute_tool\ndata: {json.dumps({'session_id': session.id, 'tool_call_id': preflight_tc_id, 'name': 'graph_janitor_scan', 'arguments': {'path': request_body.workspace_root}, 'background': True})}\n\n"
-                try:
-                    preflight_result = await asyncio.wait_for(
-                        session.tool_result_queue.get(), timeout=30,
-                    )
-                    raw = preflight_result.get("result", "{}")
-                    _cache_health(request_body.workspace_root, raw)
-                    cached_health = _get_cached_health(request_body.workspace_root)
-                    preflight_ran = True
-                    yield f"event: tool_done\ndata: {json.dumps({'tool_call_id': preflight_tc_id, 'name': 'graph_janitor_scan', 'status': 'ok', 'background': True})}\n\n"
-                except asyncio.TimeoutError:
-                    logger.info(f"Pre-flight janitor scan timed out for {request_body.workspace_root}")
-                    yield f"event: tool_done\ndata: {json.dumps({'tool_call_id': preflight_tc_id, 'name': 'graph_janitor_scan', 'status': 'timeout', 'background': True})}\n\n"
-                except Exception as e:
-                    logger.debug(f"Pre-flight janitor scan failed: {e}")
-
             system_prompt = _build_system_prompt(
                 request_body.workspace_root,
                 request_body.active_file,
-                health_context=cached_health,
                 ide_metadata=request_body.ide_metadata,
                 workspace_layout=request_body.workspace_layout,
             )
@@ -1176,10 +1101,6 @@ async def agent_stream(
                         tool_result = tool_result_data.get("result", "{}")
                         is_error = '"error"' in tool_result
                         yield f"event: tool_done\ndata: {json.dumps({'tool_call_id': tc_id, 'name': tc_name, 'status': 'error' if is_error else 'ok'})}\n\n"
-
-                    # Cache janitor scan results for system prompt injection
-                    if tc_name == "graph_janitor_scan" and not is_error:
-                        _cache_health(request_body.workspace_root, tool_result)
 
                     # Track LOC for file write/edit tools (fire-and-forget)
                     if tc_name in _FILE_WRITE_TOOLS and not is_error:
