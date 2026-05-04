@@ -854,13 +854,16 @@ async def agent_stream(
     # Fetch user's BYOK keys
     user_keys = await fetch_user_byok_keys(user_id, auth_token)
 
-    # Parse model selection from "resonant-{provider}-{model}"
-    provider_key = "groq"
-    model_name = "llama-3.3-70b-versatile"
+    # Parse model selection from "resonant-{provider}-{model}" (auto-routes if not provided)
+    provider_key: Optional[str] = None
+    model_name = ""
     if request_body.model_id and request_body.model_id.startswith("resonant-"):
         parts = request_body.model_id.replace("resonant-", "", 1).split("-", 1)
-        if len(parts) == 2:
+        if len(parts) == 2 and parts[0]:
             provider_key, model_name = parts[0], parts[1]
+    # Normalize empty provider → None so UnifiedLLMClient auto-routes through fallback chain
+    if not provider_key:
+        provider_key = None
 
     # Model-aware temperature: lower for weaker models to reduce rambling
     _WEAK_PROVIDERS = {"groq", "together", "fireworks"}

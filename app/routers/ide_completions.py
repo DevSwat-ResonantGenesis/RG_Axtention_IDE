@@ -23,8 +23,8 @@ router = APIRouter(prefix="/ide", tags=["ide-completions"])
 class IDECompletionRequest(BaseModel):
     messages: List[Dict[str, Any]]
     tools: Optional[List[Dict[str, Any]]] = None
-    model: str = "llama-3.3-70b-versatile"
-    preferred_provider: str = "groq"
+    model: str = ""
+    preferred_provider: Optional[str] = None
     temperature: float = 0.7
     max_tokens: int = 16384
 
