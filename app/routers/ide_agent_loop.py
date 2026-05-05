@@ -1048,7 +1048,7 @@ async def agent_stream(
             tool_names = [t["function"]["name"] for t in tools]
             logger.info(f"Tools selected ({len(tools)}): {tool_names}")
             logger.info(f"Prompt ({len(request_body.prompt)} chars): {request_body.prompt[:200]}")
-            max_loops = min(request_body.max_loops, 50)
+            max_loops = request_body.max_loops
             total_tool_calls = 0
             total_tokens = 0
             loops = 0
