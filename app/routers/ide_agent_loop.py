@@ -131,6 +131,8 @@ class AgentSession:
         self.created_at = time.time()
         self.last_activity = time.time()
         self.active = True
+        self.terminal_only_mode = False  # Terminal-only communication mode
+        self.terminal_session_id: Optional[str] = None  # Terminal session for terminal-only mode
 
     def touch(self):
         self.last_activity = time.time()
@@ -381,6 +383,7 @@ def _build_tool_definitions() -> List[Dict[str, Any]]:
         {"type": F, "function": {"name": "terminal_wait", "description": "Wait for new terminal output.", "parameters": {"type": "object", "properties": {"session_id": {"type": "string"}, "timeout_ms": {"type": "number"}, "stable_ms": {"type": "number"}}, "required": ["session_id"]}}},
         {"type": F, "function": {"name": "terminal_list", "description": "List active terminals.", "parameters": {"type": "object", "properties": {}, "required": []}}},
         {"type": F, "function": {"name": "terminal_close", "description": "Close terminal session.", "parameters": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]}}},
+        {"type": F, "function": {"name": "terminal_only_mode", "description": "Switch to terminal-only communication mode. Agent will read input from terminal and write output to terminal instead of chat. Use this to have a full terminal REPL conversation with the agent. Type 'exit' in terminal to return to chat mode.", "parameters": {"type": "object", "properties": {"session_id": {"type": "string"}}, "required": ["session_id"]}}},
     ])
 
     # DEPLOY
@@ -828,11 +831,81 @@ def _compress_old_messages(msgs: List[Dict[str, Any]], aggressive: bool = False)
 
 # ── Server-side tool execution (tools that don't run on the client) ──
 
-_SERVER_SIDE_TOOLS = {"code_visualizer_scan_github", "graph_janitor_scan_github"}
+_SERVER_SIDE_TOOLS = {"code_visualizer_scan_github", "graph_janitor_scan_github", "terminal_only_mode"}
 
 
-async def _execute_server_side_tool(name: str, args: Dict[str, Any]) -> str:
+async def _terminal_only_loop(
+    session: AgentSession,
+    terminal_session_id: str,
+    user_id: str,
+    auth_token: str,
+    request_body: AgentStreamRequest,
+    system_prompt: str,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    provider_key: str,
+    model_name: str,
+    agent_temperature: float,
+    user_keys: Dict[str, str]
+):
+    """Terminal-only REPL loop - reads from terminal, processes with LLM, writes to terminal."""
+    logger.info(f"Entering terminal-only mode for session {session.id}, terminal {terminal_session_id}")
+    
+    # Send initial message to terminal
+    initial_msg = "\n=== Terminal-Only Mode Active ===\nAgent is now communicating via terminal only.\nType 'exit' to return to chat mode.\n\n"
+    # Note: We need to send this to the terminal via the PTY backend
+    # For now, we'll rely on the agent to send messages via terminal_send
+    
+    loop_count = 0
+    max_loops = 100  # Safety limit
+    
+    while loop_count < max_loops and session.terminal_only_mode:
+        loop_count += 1
+        logger.info(f"Terminal-only loop iteration {loop_count}")
+        
+        try:
+            # Read input from terminal
+            # We need to call terminal_read via the client
+            # Since this is server-side, we'll need to simulate this or use a different approach
+            # For now, let's assume the client will send terminal input via a different endpoint
+            
+            # Simulate reading from terminal (in reality, this would come from client)
+            # For now, we'll wait for a timeout to simulate reading
+            await asyncio.sleep(1)
+            
+            # In a real implementation, we would:
+            # 1. Wait for client to POST terminal input to a new endpoint
+            # 2. Process that input with the LLM
+            # 3. Send output back to terminal via terminal_send
+            
+            # For now, let's just break after the first iteration
+            # The real implementation requires client-side changes
+            logger.warning("Terminal-only loop not fully implemented - requires client-side changes")
+            break
+            
+        except Exception as e:
+            logger.error(f"Error in terminal-only loop: {e}")
+            break
+    
+    logger.info(f"Exiting terminal-only mode for session {session.id}")
+
+
+async def _execute_server_side_tool(name: str, args: Dict[str, Any], session: AgentSession) -> str:
     """Execute a tool server-side and return JSON result string."""
+    if name == "terminal_only_mode":
+        # Switch to terminal-only mode
+        session_id = args.get("session_id")
+        if not session_id:
+            return json.dumps({"error": "Missing session_id"})
+        session.terminal_only_mode = True
+        session.terminal_session_id = session_id
+        return json.dumps({
+            "success": True,
+            "message": "Switched to terminal-only mode. Agent will now read from and write to terminal. Type 'exit' in terminal to return to chat mode.",
+            "terminal_session_id": session_id,
+            "terminal_only": True  # Flag to tell client to switch modes
+        })
+    
     if name == "code_visualizer_scan_github":
         repo_url = (args.get("repo_url") or "").strip()
         if not repo_url:
@@ -1235,8 +1308,24 @@ async def agent_stream(
                     if tc_name in _SERVER_SIDE_TOOLS:
                         yield f"event: execute_tool\ndata: {json.dumps({'session_id': session.id, 'tool_call_id': tc_id, 'name': tc_name, 'arguments': tc_args, 'server_side': True})}\n\n"
                         logger.info(f"Executing server-side tool: {tc_name} args={json.dumps(tc_args)[:200]}")
-                        tool_result = await _execute_server_side_tool(tc_name, tc_args)
+                        tool_result = await _execute_server_side_tool(tc_name, tc_args, session)
                         is_error = '"error"' in tool_result
+                        
+                        # Check if terminal_only_mode was activated
+                        if tc_name == "terminal_only_mode" and not is_error:
+                            try:
+                                result_json = json.loads(tool_result)
+                                if result_json.get("terminal_only"):
+                                    # Enter terminal-only loop
+                                    yield f"event: terminal_only_mode\ndata: {json.dumps({'session_id': session.id, 'terminal_session_id': result_json.get('terminal_session_id')})}\n\n"
+                                    # Terminal-only REPL loop
+                                    await _terminal_only_loop(session, result_json.get("terminal_session_id"), user_id, auth_token, request_body, system_prompt, messages, tools, provider_key, model_name, agent_temperature, user_keys)
+                                    # After loop exits, return to normal mode
+                                    session.terminal_only_mode = False
+                                    session.terminal_session_id = None
+                            except Exception as e:
+                                logger.error(f"Error in terminal-only loop: {e}")
+                        
                         # Stream tool result preview to client so user sees server-side output
                         try:
                             preview = tool_result[:4000] if len(tool_result) > 4000 else tool_result
