@@ -25,7 +25,7 @@ router = APIRouter(prefix="/ide", tags=["ide-providers"])
 
 # Provider display names (override rg_llm's terse names)
 _DISPLAY_NAMES: Dict[str, str] = {
-    "tokenrouter": "Auto (Smart)",
+    "tokenrouter": "TokenRouter (72 Models)",
     "openai": "ChatGPT",
     "anthropic": "Claude",
     "groq": "Groq",
@@ -42,7 +42,7 @@ _DISPLAY_NAMES: Dict[str, str] = {
 
 # Capabilities per provider
 _CAPABILITIES: Dict[str, List[str]] = {
-    "tokenrouter": ["chat", "coding", "vision", "tools"],
+    "tokenrouter": ["chat", "coding", "vision", "tools", "image", "video", "audio"],
     "openai": ["chat", "coding", "vision", "image"],
     "anthropic": ["chat", "coding", "vision"],
     "groq": ["chat", "coding"],
