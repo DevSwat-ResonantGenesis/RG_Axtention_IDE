@@ -604,22 +604,28 @@ if new_user_msg:
   - Added 💻 emoji to terminal tool labels for visibility
 - **Impact:** Terminal tools now available for build/test/install tasks, more visible in chat
 
-#### 11. Embedded Terminal in Chat ❌ REVERTED (Using VS Code Native Terminal)
-- **Status:** Reverted (2026-05-05) - Using VS Code native terminal instead
-- **Reason:** Attempted xterm.js integration in chat webview caused TypeScript syntax errors
-- **Current Approach:**
-  - Uses VS Code native terminal API (`vscode.window.createTerminal`)
-  - Terminal appears in VS Code terminal panel (side panel)
-  - Terminal output is displayed in chat via tool blocks
-  - User can interact with terminal in VS Code panel
-  - This is similar to WindSurf/Cascade's approach (output in chat, terminal in panel)
-- **Impact:** Terminal tools work with VS Code native terminal, output visible in chat
+#### 11. Embedded Terminal in Chat ✅ IMPLEMENTED (xterm.js in Chat Webview)
+- **Status:** Implemented (2026-05-05) - Real terminal embedded in chat using xterm.js
+- **Files:**
+  - `RG_IDE/extensions/resonant-ai/package.json` - Added xterm.js dependencies
+  - `RG_IDE/extensions/resonant-ai/src/chatViewProvider.ts` - Added embedded terminal HTML, CSS, and JavaScript
+  - `RG_Axtention_IDE/app/pty_stream.py` - PTY streaming backend endpoint
+  - `RG_Axtention_IDE/app/main.py` - Registered PTY router
+  - `RG_IDE/extensions/resonant-ai/src/extension.ts` - Set API URL for embedded terminal
+  - `RG_IDE/extensions/resonant-ai/src/toolExecutor.ts` - Updated terminal tools to use embedded terminal
+- **Implementation:**
+  - **Frontend:** xterm.js embedded directly in chat webview (not separate panel)
+  - **Backend:** Python PTY streaming via WebSocket (pty_stream.py)
+  - **Real-time streaming:** Output streamed via WebSocket as it happens
+  - **Interactive input:** User can type in embedded terminal input field during execution
+  - **Fallback:** Falls back to VS Code native terminal if backend unavailable
+- **Impact:** Terminal now embedded directly in chat with live output and interactive input, similar to WindSurf/Cascade
 
 ---
 
 ## Summary
 
-**9 priority fixes implemented.** All major memory/context issues addressed:
+**10 priority fixes implemented.** All major memory/context issues addressed plus embedded terminal:
 - Context window increased 2.3x (22→50)
 - Compression reduced 2.5x (4→10 messages)
 - Session persistence added
@@ -627,6 +633,7 @@ if new_user_msg:
 - Checkpoints auto-load for recent work
 - Automatic todo list creation for complex tasks
 - Terminal tool visibility improved
+- **Embedded terminal in chat (WindSurf/Cascade-like experience with xterm.js)**
 
 The IDE should now:
 - Maintain context across much longer conversations
@@ -635,6 +642,7 @@ The IDE should now:
 - Automatically bring in relevant past context
 - Resume work from recent checkpoints
 - Create visible action plans for complex work (like Cascade/Windsurf)
-- Use interactive terminals for build/test/install tasks (VS Code terminal panel with output in chat)
+- Use interactive terminals for build/test/install tasks
+- **See live terminal output embedded in chat with interactive input (passwords, prompts)**
 
-**Note:** Embedded terminal in chat was attempted but reverted due to TypeScript integration complexity. Current approach uses VS Code native terminal with output displayed in chat tool blocks.
+**Next steps:** Deploy changes, run `npm install` in extension directory for xterm.js dependencies, and monitor metrics to verify effectiveness.
