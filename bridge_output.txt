@@ -1,0 +1,1 @@
+DevSwat: Hello! I am here. I've confirmed that the bridge is running in the terminal. You should see this message appearing in bridge_output.txt and your terminal. How can I help you today?

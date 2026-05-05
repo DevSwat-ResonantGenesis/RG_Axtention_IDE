@@ -128,6 +128,7 @@ class AgentSession:
         self.tool_result_queue: asyncio.Queue = asyncio.Queue()
         self.llm_result_queue: asyncio.Queue = asyncio.Queue()  # LLM proxy for local Ollama
         self.user_message_queue: asyncio.Queue = asyncio.Queue()  # Allow user interruptions
+        self.terminal_input_queue: asyncio.Queue = asyncio.Queue()  # Terminal input for terminal-only mode
         self.created_at = time.time()
         self.last_activity = time.time()
         self.active = True
@@ -845,7 +846,7 @@ async def terminal_input(
     request_body: TerminalInputRequest,
     request: Request,
 ):
-    """Receive terminal input for terminal-only mode. Returns agent response (not SSE, just JSON)."""
+    """Receive terminal input for terminal-only mode. Puts input in session queue."""
     # Auth: accept bearer token or x-user-id header
     auth_header = request.headers.get("authorization", "")
     auth_token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
@@ -860,48 +861,10 @@ async def terminal_input(
     
     logger.info(f"Terminal input received: session={session.id} input={request_body.input[:100]}")
     
-    try:
-        # Process the terminal input with the LLM
-        system_prompt = _build_system_prompt(
-            session.workspace_root,
-            None,  # No active file in terminal mode
-            ide_metadata=None,
-            workspace_layout=None,
-        )
-        messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-        messages.append({"role": "user", "content": request_body.input})
-        
-        tools = _build_tool_definitions()
-        
-        # Fetch user's BYOK keys
-        user_keys = await fetch_user_byok_keys(user_id, auth_token)
-        
-        # Call LLM (non-streaming for simplicity)
-        llm_response = ""
-        tool_calls = []
-        
-        async for chunk in call_llm_streaming(
-            messages=messages,
-            provider_key="",  # Use default
-            model_name="",  # Use default
-            temperature=0.7,
-            user_keys=user_keys,
-        ):
-            if chunk.get("type") == "content":
-                llm_response += chunk.get("content", "")
-            elif chunk.get("type") == "tool_call":
-                tool_calls.append(chunk)
-        
-        # For terminal-only mode, we just return the text response
-        # Tool execution would require client-side changes
-        return {
-            "response": llm_response,
-            "tool_calls": tool_calls if tool_calls else None
-        }
-        
-    except Exception as e:
-        logger.error(f"Terminal input processing error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    # Put input in the terminal input queue
+    await session.terminal_input_queue.put(request_body.input)
+    
+    return {"status": "ok", "message": "Terminal input received"}
 
 
 
@@ -1172,7 +1135,21 @@ async def agent_stream(
                             if chunk.event == "chunk":
                                 if chunk.content:
                                     content += chunk.content
-                                    yield f"event: text\ndata: {json.dumps({'content': chunk.content})}\n\n"
+                                    # In terminal-only mode, send to terminal instead of chat
+                                    if session.terminal_only_mode:
+                                        try:
+                                            import httpx
+                                            async with httpx.AsyncClient() as client:
+                                                await client.post(
+                                                    f"{request_body.api_url or 'https://dev-swat.com'}/api/v1/ide/terminal-send",
+                                                    json={"session_id": session.terminal_session_id, "input": chunk.content},
+                                                    headers={"authorization": f"Bearer {auth_token}"},
+                                                    timeout=5.0
+                                                )
+                                        except Exception as e:
+                                            logger.error(f"Failed to send to terminal: {e}")
+                                    else:
+                                        yield f"event: text\ndata: {json.dumps({'content': chunk.content})}\n\n"
 
                             elif chunk.event == "fallback":
                                 fallback_attempt += 1
@@ -1334,8 +1311,119 @@ async def agent_stream(
                                 if result_json.get("terminal_only"):
                                     # Send terminal_only_mode event to client
                                     yield f"event: terminal_only_mode\ndata: {json.dumps({'session_id': session.id, 'terminal_session_id': result_json.get('terminal_session_id')})}\n\n"
-                                    # Don't enter loop on server - client will handle terminal-only mode
-                                    # by posting to /terminal-input endpoint
+                                    # Enter terminal-only REPL loop
+                                    yield f"event: text\ndata: {json.dumps({'content': '\\n=== Terminal-Only Mode Active ===\\nAgent is now communicating via terminal only. Type `exit` in terminal to return to chat mode.\\n'})}\n\n"
+                                    
+                                    # Terminal-only REPL loop
+                                    while session.terminal_only_mode:
+                                        try:
+                                            # Wait for terminal input (with timeout)
+                                            try:
+                                                terminal_input = await asyncio.wait_for(
+                                                    session.terminal_input_queue.get(),
+                                                    timeout=300.0  # 5 minute timeout
+                                                )
+                                            except asyncio.TimeoutError:
+                                                # Timeout - exit terminal-only mode
+                                                logger.info("Terminal-only mode timeout, exiting")
+                                                break
+                                            
+                                            # Check for exit command
+                                            if terminal_input.strip().lower() in ['exit', 'quit']:
+                                                yield f"event: text\ndata: {json.dumps({'content': '\\nExiting terminal-only mode. Returning to chat mode.\\n'})}\n\n"
+                                                session.terminal_only_mode = False
+                                                session.terminal_session_id = None
+                                                break
+                                            
+                                            # Process terminal input with LLM
+                                            messages.append({"role": "user", "content": terminal_input})
+                                            
+                                            # Call LLM
+                                            content = ""
+                                            tool_calls = []
+                                            
+                                            async for chunk in call_llm_streaming(
+                                                messages=messages,
+                                                preferred_provider=provider_key or "openai",
+                                                preferred_model=model_name or "gpt-4o",
+                                                user_keys=user_keys,
+                                                tools=tools,
+                                                tool_choice="auto",
+                                                temperature=agent_temperature,
+                                                max_tokens=16384,
+                                                local_llm=None,
+                                            ):
+                                                if chunk.event == "chunk":
+                                                    if chunk.content:
+                                                        content += chunk.content
+                                                        # Send to terminal
+                                                        try:
+                                                            import httpx
+                                                            async with httpx.AsyncClient() as client:
+                                                                await client.post(
+                                                                    f"{request_body.api_url or 'https://dev-swat.com'}/api/v1/ide/terminal-send",
+                                                                    json={"session_id": session.terminal_session_id, "input": chunk.content},
+                                                                    headers={"authorization": f"Bearer {auth_token}"},
+                                                                    timeout=5.0
+                                                                )
+                                                        except Exception as e:
+                                                            logger.error(f"Failed to send to terminal: {e}")
+                                                
+                                                elif chunk.event == "tool_calls":
+                                                    tool_calls = chunk.tool_calls or []
+                                            
+                                            # Execute tools if any
+                                            if tool_calls:
+                                                for tc in tool_calls:
+                                                    tc_name = tc.get("name")
+                                                    tc_args = tc.get("arguments", {})
+                                                    tc_id = tc.get("id")
+                                                    
+                                                    if tc_name in _SERVER_SIDE_TOOLS:
+                                                        tool_result = await _execute_server_side_tool(tc_name, tc_args, session)
+                                                    else:
+                                                        # Client-side tools - send to client
+                                                        yield f"event: execute_tool\ndata: {json.dumps({'session_id': session.id, 'tool_call_id': tc_id, 'name': tc_name, 'arguments': tc_args})}\n\n"
+                                                        tool_result = await session.tool_result_queue.get()
+                                                    
+                                                    messages.append({"role": "assistant", "content": None, "tool_calls": [tc]})
+                                                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
+                                            else:
+                                                messages.append({"role": "assistant", "content": content})
+                                            
+                                            # Add newline to terminal
+                                            try:
+                                                import httpx
+                                                async with httpx.AsyncClient() as client:
+                                                    await client.post(
+                                                        f"{request_body.api_url or 'https://dev-swat.com'}/api/v1/ide/terminal-send",
+                                                        json={"session_id": session.terminal_session_id, "input": "\\n"},
+                                                        headers={"authorization": f"Bearer {auth_token}"},
+                                                        timeout=5.0
+                                                    )
+                                            except Exception as e:
+                                                logger.error(f"Failed to send newline to terminal: {e}")
+                                            
+                                            # Send prompt for next input
+                                            try:
+                                                import httpx
+                                                async with httpx.AsyncClient() as client:
+                                                    await client.post(
+                                                        f"{request_body.api_url or 'https://dev-swat.com'}/api/v1/ide/terminal-send",
+                                                        json={"session_id": session.terminal_session_id, "input": "\\n> "},
+                                                        headers={"authorization": f"Bearer {auth_token}"},
+                                                        timeout=5.0
+                                                    )
+                                            except Exception as e:
+                                                logger.error(f"Failed to send prompt to terminal: {e}")
+                                            
+                                        except Exception as e:
+                                            logger.error(f"Error in terminal-only loop: {e}")
+                                            break
+                                    
+                                    # After loop exits, continue with normal flow
+                                    yield f"event: text\ndata: {json.dumps({'content': '\\n=== Returned to Chat Mode ===\\n'})}\n\n"
+                                    
                             except Exception as e:
                                 logger.error(f"Error handling terminal_only_mode: {e}")
                         
