@@ -19,6 +19,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .routers import ide_agent_loop_router, ide_completions_router, ide_providers_router
+from .pty_stream import router as pty_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +44,7 @@ app.add_middleware(
 app.include_router(ide_agent_loop_router, prefix="/api/v1")
 app.include_router(ide_completions_router, prefix="/api/v1")
 app.include_router(ide_providers_router, prefix="/api/v1")
+app.include_router(pty_router, prefix="/api/v1")
 
 
 @app.get("/health")

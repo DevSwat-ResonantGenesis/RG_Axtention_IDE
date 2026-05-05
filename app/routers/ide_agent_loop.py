@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import pickle
 import re
 import time
 import uuid
@@ -116,6 +117,7 @@ async def _track_loc_event(
 
 SESSION_TIMEOUT = 300  # 5 min
 MAX_SESSIONS = 100
+SESSION_FILE = "/tmp/ide_sessions.pkl"  # Persistent session storage
 
 
 class AgentSession:
@@ -125,6 +127,7 @@ class AgentSession:
         self.workspace_root = workspace_root
         self.tool_result_queue: asyncio.Queue = asyncio.Queue()
         self.llm_result_queue: asyncio.Queue = asyncio.Queue()  # LLM proxy for local Ollama
+        self.user_message_queue: asyncio.Queue = asyncio.Queue()  # Allow user interruptions
         self.created_at = time.time()
         self.last_activity = time.time()
         self.active = True
@@ -138,6 +141,118 @@ class AgentSession:
 
 
 _sessions: Dict[str, AgentSession] = {}
+
+
+def save_sessions_to_disk() -> None:
+    """Persist active sessions to disk for recovery after restart."""
+    try:
+        with open(SESSION_FILE, 'wb') as f:
+            pickle.dump(_sessions, f)
+        logger.debug(f"Saved {len(_sessions)} sessions to disk")
+    except Exception as e:
+        logger.warning(f"Failed to save sessions to disk: {e}")
+
+
+def load_sessions_from_disk() -> None:
+    """Load persisted sessions from disk on startup."""
+    try:
+        if os.path.exists(SESSION_FILE):
+            with open(SESSION_FILE, 'rb') as f:
+                loaded_sessions = pickle.load(f)
+                # Only restore non-expired sessions
+                now = time.time()
+                for sid, session in loaded_sessions.items():
+                    if not session.expired:
+                        _sessions[sid] = session
+                logger.info(f"Loaded {len(_sessions)} non-expired sessions from disk")
+    except Exception as e:
+        logger.warning(f"Failed to load sessions from disk: {e}")
+
+
+# Load sessions on module import
+load_sessions_from_disk()
+
+
+async def _auto_inject_memories(
+    workspace_root: str,
+    prompt: str,
+    user_id: str,
+    auth_token: str
+) -> Optional[str]:
+    """Automatically retrieve and inject relevant memories at conversation start.
+    
+    This ensures the LLM has context from previous sessions without relying on it
+    to voluntarily call read_memory.
+    """
+    try:
+        # Try to retrieve memories from server-backed Hash Sphere if authenticated
+        if auth_token:
+            memory_url = os.getenv("MEMORY_SERVICE_URL", "http://rg_memory:8000")
+            headers = {"Authorization": f"Bearer {auth_token}"}
+            
+            # Query for workspace-related memories
+            query = f"{workspace_root} architecture structure decisions"
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.post(
+                    f"{memory_url}/api/v1/user-memory/memories/retrieve",
+                    json={"query": query, "limit": 5},
+                    headers=headers
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    memories = data.get("memories", data.get("results", []))
+                    if memories:
+                        memory_text = "\n".join([
+                            f"- {m.get('title', m.get('content', ''))[:200]}"
+                            for m in memories[:3]
+                        ])
+                        return f"\n[RELEVANT MEMORIES FROM PREVIOUS SESSIONS]\n{memory_text}\n"
+    except Exception as e:
+        logger.debug(f"Auto memory injection failed (non-critical): {e}")
+    
+    return None
+
+
+def _is_complex_task(prompt: str) -> bool:
+    """Detect if a task is complex enough to require a todo list plan.
+    
+    Complex tasks typically:
+    - Are longer than 50 characters
+    - Contain multiple action verbs
+    - Mention "and", "then", "also", "plus"
+    - Ask for implementation, refactoring, or debugging
+    """
+    prompt_lower = prompt.lower()
+    
+    # Short prompts are likely simple
+    if len(prompt) < 50:
+        return False
+    
+    # Keywords indicating multi-step work
+    multi_step_keywords = [
+        "implement", "build", "create", "add", "refactor", "fix", "debug",
+        "update", "migrate", "convert", "integrate", "setup", "configure",
+        "and then", "also", "plus", "additionally", "furthermore"
+    ]
+    
+    # Count multi-step indicators
+    keyword_count = sum(1 for kw in multi_step_keywords if kw in prompt_lower)
+    
+    # If 2+ keywords found, it's likely complex
+    if keyword_count >= 2:
+        return True
+    
+    # Check for conjunctions suggesting multiple parts
+    conjunctions = [" and ", " then ", " also ", " plus "]
+    if any(c in prompt_lower for c in conjunctions):
+        return True
+    
+    # Check for implementation/build language
+    impl_keywords = ["implement", "build", "create", "add feature", "refactor"]
+    if any(kw in prompt_lower for kw in impl_keywords):
+        return True
+    
+    return False
 
 
 def _cleanup_sessions():
@@ -344,7 +459,7 @@ def _select_tools(query: str) -> List[Dict[str, Any]]:
         names |= _VIZ_NAMES
     if re.search(r'\b(plan|todo|task|step|remember|memory|save|note)\b', q):
         names |= _PLAN_NAMES
-    if re.search(r'\b(terminal|interactive|repl|session|ssh|prompt|dev.?server|monitor)\b', q):
+    if re.search(r'\b(terminal|interactive|repl|session|ssh|prompt|dev.?server|monitor|install|build|test|run|start|npm|yarn|pip|cargo|go.?run|python|node|docker|kubectl)\b', q):
         names |= _TERM_NAMES
     if re.search(r'\b(deploy|build|production|release|ship|publish)\b', q):
         names |= _DEPLOY_NAMES
@@ -690,17 +805,25 @@ def _summarize_tool_result(name: str, raw: str, cap: int = 1500) -> str:
     return raw[:cap - 40] + f"\n\n... (truncated, {len(raw)} total chars)"
 
 
-def _compress_old_messages(msgs: List[Dict[str, Any]]) -> None:
-    cutoff = len(msgs) - 4
+def _compress_old_messages(msgs: List[Dict[str, Any]], aggressive: bool = False) -> None:
+    """Compress old messages to save tokens. Less aggressive by default."""
+    if aggressive:
+        # Old behavior: compress everything older than 4 messages
+        cutoff = len(msgs) - 4
+    else:
+        # New behavior: compress everything older than 10 messages
+        cutoff = len(msgs) - 10
+    
     for i in range(1, cutoff):
         m = msgs[i]
         if m.get("role") == "tool" and isinstance(m.get("content"), str) and len(m["content"]) > 150:
-            # Preserve code_visualizer results better — keep 2000 chars instead of wiping
+            # Preserve code_visualizer results better — keep 4000 chars instead of 2000
             if m.get("name", "").startswith("code_visualizer_"):
-                if len(m["content"]) > 2000:
-                    m["content"] = m["content"][:2000] + f"\n... (compressed from {len(m['content'])} chars)"
-            else:
-                m["content"] = f"[Tool result for {m.get('name', 'unknown')}: {len(m['content'])} chars — compressed]"
+                if len(m["content"]) > 4000:
+                    m["content"] = m["content"][:4000] + f"\n... (compressed from {len(m['content'])} chars)"
+            # Preserve other tool results better — keep 3000 chars
+            elif len(m["content"]) > 3000:
+                m["content"] = m["content"][:3000] + f"\n... (compressed from {len(m['content'])} chars)"
 
 
 # ── Server-side tool execution (tools that don't run on the client) ──
@@ -848,7 +971,26 @@ async def agent_stream(
                     if ctx.get("role") in ("user", "assistant"):
                         messages.append({"role": ctx["role"], "content": ctx.get("content", "")})
 
+            # Auto-inject relevant memories at conversation start for context continuity
+            if not request_body.context or len(request_body.context) < 3:
+                # Only auto-inject on new conversations (little to no history)
+                memory_injection = await _auto_inject_memories(
+                    workspace_root=request_body.workspace_root,
+                    prompt=request_body.prompt,
+                    user_id=user_id,
+                    auth_token=auth_token
+                )
+                if memory_injection:
+                    messages.append({"role": "system", "content": memory_injection})
+
             messages.append({"role": "user", "content": request_body.prompt})
+
+            # Detect if task requires a plan (complex, multi-step, ambiguous)
+            requires_plan = _is_complex_task(request_body.prompt)
+            if requires_plan:
+                # Force plan creation by modifying the prompt
+                plan_instruction = "\n\nFIRST: Create a detailed action plan using the todo_list tool. Break this task into specific steps. Mark all steps as 'pending'. Then execute the steps one by one, marking each as 'in_progress' when starting and 'completed' when done.\n"
+                request_body.prompt = request_body.prompt + plan_instruction
 
             tools = _select_tools(request_body.prompt)
             tool_names = [t["function"]["name"] for t in tools]
@@ -861,6 +1003,7 @@ async def agent_stream(
             last_provider = ""
             last_model = ""
             fallback_chain = []
+            todo_list_created = False
 
             while loops < max_loops:
                 loops += 1
@@ -875,7 +1018,12 @@ async def agent_stream(
                 loop_fallback_chain = []
 
                 # Force tool use on first loop so agent investigates before talking
-                loop_tool_choice = "required" if loops == 1 and tools else "auto"
+                # If task requires plan, force todo_list creation on first loop
+                if requires_plan and loops == 1 and not todo_list_created:
+                    # Force todo_list tool on first loop for complex tasks
+                    loop_tool_choice = {"type": "function", "function": {"name": "todo_list"}}
+                else:
+                    loop_tool_choice = "required" if loops == 1 and tools else "auto"
 
                 use_ollama_proxy = (provider_key == "ollama" and request_body.local_llm is not None)
                 llm_done = False
@@ -1077,6 +1225,12 @@ async def agent_stream(
 
                     total_tool_calls += 1
 
+                    # Track todo_list creation for plan enforcement
+                    if tc_name == "todo_list":
+                        todo_list_created = True
+                        # Stream todo_list to client for display
+                        yield f"event: todo_list\ndata: {json.dumps({'todos': tc_args.get('todos', [])})}\n\n"
+
                     # Server-side tools: execute directly, don't send to client
                     if tc_name in _SERVER_SIDE_TOOLS:
                         yield f"event: execute_tool\ndata: {json.dumps({'session_id': session.id, 'tool_call_id': tc_id, 'name': tc_name, 'arguments': tc_args, 'server_side': True})}\n\n"
@@ -1133,7 +1287,7 @@ async def agent_stream(
                     })
                     content = ""
 
-                if len(messages) > 22:
+                if len(messages) > 50:
                     system = messages[0]
                     # Always preserve the user's original request (first user message after system + context)
                     user_msg = None
@@ -1141,12 +1295,12 @@ async def agent_stream(
                         if m.get("role") == "user":
                             user_msg = m
                             break
-                    recent = messages[-20:]
+                    recent = messages[-45:]
                     messages = [system] + recent
                     # Re-inject original user request right after system if it was dropped
                     if user_msg and user_msg not in recent:
                         messages.insert(1, user_msg)
-                    _compress_old_messages(messages)
+                    _compress_old_messages(messages, aggressive=False)
 
                 # Emit loop progress so client sees reasoning between loops
                 if loops < max_loops:
@@ -1162,6 +1316,7 @@ async def agent_stream(
         finally:
             session.active = False
             _sessions.pop(session.id, None)
+            save_sessions_to_disk()
 
     return StreamingResponse(
         generate(),
