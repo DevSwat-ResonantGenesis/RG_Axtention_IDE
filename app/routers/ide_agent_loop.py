@@ -834,60 +834,76 @@ def _compress_old_messages(msgs: List[Dict[str, Any]], aggressive: bool = False)
 _SERVER_SIDE_TOOLS = {"code_visualizer_scan_github", "graph_janitor_scan_github", "terminal_only_mode"}
 
 
-async def _terminal_only_loop(
-    session: AgentSession,
-    terminal_session_id: str,
-    user_id: str,
-    auth_token: str,
-    request_body: AgentStreamRequest,
-    system_prompt: str,
-    messages: List[Dict[str, Any]],
-    tools: List[Dict[str, Any]],
-    provider_key: str,
-    model_name: str,
-    agent_temperature: float,
-    user_keys: Dict[str, str]
+# ── Terminal-only communication endpoint ──
+
+class TerminalInputRequest(BaseModel):
+    session_id: str
+    input: str
+
+@router.post("/terminal-input")
+async def terminal_input(
+    request_body: TerminalInputRequest,
+    request: Request,
 ):
-    """Terminal-only REPL loop - reads from terminal, processes with LLM, writes to terminal."""
-    logger.info(f"Entering terminal-only mode for session {session.id}, terminal {terminal_session_id}")
+    """Receive terminal input for terminal-only mode. Returns agent response (not SSE, just JSON)."""
+    # Auth: accept bearer token or x-user-id header
+    auth_header = request.headers.get("authorization", "")
+    auth_token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
+    user_id = request.headers.get("x-user-id") or auth_token[:20] or "anonymous"
+    if not auth_token and not request.headers.get("x-user-id"):
+        raise HTTPException(status_code=401, detail="Authentication required")
     
-    # Send initial message to terminal
-    initial_msg = "\n=== Terminal-Only Mode Active ===\nAgent is now communicating via terminal only.\nType 'exit' to return to chat mode.\n\n"
-    # Note: We need to send this to the terminal via the PTY backend
-    # For now, we'll rely on the agent to send messages via terminal_send
+    session = _get_or_fail(request_body.session_id)
     
-    loop_count = 0
-    max_loops = 100  # Safety limit
+    if not session.terminal_only_mode:
+        raise HTTPException(status_code=400, detail="Session not in terminal-only mode")
     
-    while loop_count < max_loops and session.terminal_only_mode:
-        loop_count += 1
-        logger.info(f"Terminal-only loop iteration {loop_count}")
+    logger.info(f"Terminal input received: session={session.id} input={request_body.input[:100]}")
+    
+    try:
+        # Process the terminal input with the LLM
+        system_prompt = _build_system_prompt(
+            session.workspace_root,
+            None,  # No active file in terminal mode
+            ide_metadata=None,
+            workspace_layout=None,
+        )
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        messages.append({"role": "user", "content": request_body.input})
         
-        try:
-            # Read input from terminal
-            # We need to call terminal_read via the client
-            # Since this is server-side, we'll need to simulate this or use a different approach
-            # For now, let's assume the client will send terminal input via a different endpoint
-            
-            # Simulate reading from terminal (in reality, this would come from client)
-            # For now, we'll wait for a timeout to simulate reading
-            await asyncio.sleep(1)
-            
-            # In a real implementation, we would:
-            # 1. Wait for client to POST terminal input to a new endpoint
-            # 2. Process that input with the LLM
-            # 3. Send output back to terminal via terminal_send
-            
-            # For now, let's just break after the first iteration
-            # The real implementation requires client-side changes
-            logger.warning("Terminal-only loop not fully implemented - requires client-side changes")
-            break
-            
-        except Exception as e:
-            logger.error(f"Error in terminal-only loop: {e}")
-            break
-    
-    logger.info(f"Exiting terminal-only mode for session {session.id}")
+        tools = _build_tool_definitions()
+        
+        # Fetch user's BYOK keys
+        user_keys = await fetch_user_byok_keys(user_id, auth_token)
+        
+        # Call LLM (non-streaming for simplicity)
+        llm_response = ""
+        tool_calls = []
+        
+        async for chunk in call_llm_streaming(
+            messages=messages,
+            provider_key="",  # Use default
+            model_name="",  # Use default
+            temperature=0.7,
+            user_keys=user_keys,
+        ):
+            if chunk.get("type") == "content":
+                llm_response += chunk.get("content", "")
+            elif chunk.get("type") == "tool_call":
+                tool_calls.append(chunk)
+        
+        # For terminal-only mode, we just return the text response
+        # Tool execution would require client-side changes
+        return {
+            "response": llm_response,
+            "tool_calls": tool_calls if tool_calls else None
+        }
+        
+    except Exception as e:
+        logger.error(f"Terminal input processing error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 
 
 async def _execute_server_side_tool(name: str, args: Dict[str, Any], session: AgentSession) -> str:
@@ -1316,15 +1332,12 @@ async def agent_stream(
                             try:
                                 result_json = json.loads(tool_result)
                                 if result_json.get("terminal_only"):
-                                    # Enter terminal-only loop
+                                    # Send terminal_only_mode event to client
                                     yield f"event: terminal_only_mode\ndata: {json.dumps({'session_id': session.id, 'terminal_session_id': result_json.get('terminal_session_id')})}\n\n"
-                                    # Terminal-only REPL loop
-                                    await _terminal_only_loop(session, result_json.get("terminal_session_id"), user_id, auth_token, request_body, system_prompt, messages, tools, provider_key, model_name, agent_temperature, user_keys)
-                                    # After loop exits, return to normal mode
-                                    session.terminal_only_mode = False
-                                    session.terminal_session_id = None
+                                    # Don't enter loop on server - client will handle terminal-only mode
+                                    # by posting to /terminal-input endpoint
                             except Exception as e:
-                                logger.error(f"Error in terminal-only loop: {e}")
+                                logger.error(f"Error handling terminal_only_mode: {e}")
                         
                         # Stream tool result preview to client so user sees server-side output
                         try:
