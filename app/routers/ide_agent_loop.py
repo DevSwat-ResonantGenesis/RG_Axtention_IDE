@@ -176,6 +176,75 @@ def load_sessions_from_disk() -> None:
 load_sessions_from_disk()
 
 
+# ── Conversation persistence (full context across requests) ──
+
+CONVERSATION_TIMEOUT = 3600  # 1 hour
+MAX_CONVERSATIONS = 200
+CONVERSATION_FILE = "/tmp/ide_conversations.pkl"
+
+
+class ConversationState:
+    """Persistent conversation state across multiple agent-stream requests.
+
+    Unlike AgentSession (ephemeral per-request), ConversationState survives
+    across user messages so the LLM retains full tool context — file reads,
+    search results, command outputs — exactly like Windsurf/Cascade.
+    """
+    def __init__(self, user_id: str, workspace_root: str):
+        self.user_id = user_id
+        self.workspace_root = workspace_root
+        self.messages: List[Dict[str, Any]] = []  # Full conversation history
+        self.created_at = time.time()
+        self.last_activity = time.time()
+
+    def touch(self):
+        self.last_activity = time.time()
+
+    @property
+    def expired(self):
+        return time.time() - self.last_activity > CONVERSATION_TIMEOUT
+
+
+_conversations: Dict[str, ConversationState] = {}
+
+
+def _cleanup_conversations():
+    """Evict expired and excess conversations."""
+    expired = [cid for cid, c in _conversations.items() if c.expired]
+    for cid in expired:
+        _conversations.pop(cid, None)
+    if len(_conversations) > MAX_CONVERSATIONS:
+        sorted_convos = sorted(_conversations.items(), key=lambda x: x[1].last_activity)
+        for cid, _ in sorted_convos[:len(_conversations) - MAX_CONVERSATIONS]:
+            _conversations.pop(cid, None)
+
+
+def save_conversations_to_disk() -> None:
+    """Persist conversations for recovery after restart."""
+    try:
+        with open(CONVERSATION_FILE, 'wb') as f:
+            pickle.dump(_conversations, f)
+    except Exception as e:
+        logger.debug(f"Failed to save conversations to disk: {e}")
+
+
+def load_conversations_from_disk() -> None:
+    """Load persisted conversations on startup."""
+    try:
+        if os.path.exists(CONVERSATION_FILE):
+            with open(CONVERSATION_FILE, 'rb') as f:
+                loaded = pickle.load(f)
+                for cid, convo in loaded.items():
+                    if not convo.expired:
+                        _conversations[cid] = convo
+                logger.info(f"Loaded {len(_conversations)} conversations from disk")
+    except Exception as e:
+        logger.warning(f"Failed to load conversations from disk: {e}")
+
+
+load_conversations_from_disk()
+
+
 async def _auto_inject_memories(
     workspace_root: str,
     prompt: str,
@@ -219,40 +288,32 @@ async def _auto_inject_memories(
 def _is_complex_task(prompt: str) -> bool:
     """Detect if a task is complex enough to require a todo list plan.
     
-    Complex tasks typically:
-    - Are longer than 50 characters
-    - Contain multiple action verbs
-    - Mention "and", "then", "also", "plus"
-    - Ask for implementation, refactoring, or debugging
+    Only returns True for GENUINELY multi-step tasks that explicitly
+    describe multiple distinct actions. Single actions (even complex ones
+    like "refactor the auth module") should NOT trigger planning.
     """
     prompt_lower = prompt.lower()
     
-    # Short prompts are likely simple
-    if len(prompt) < 50:
+    # Must be a substantial prompt to be multi-step
+    if len(prompt) < 120:
         return False
     
-    # Keywords indicating multi-step work
-    multi_step_keywords = [
-        "implement", "build", "create", "add", "refactor", "fix", "debug",
-        "update", "migrate", "convert", "integrate", "setup", "configure",
-        "and then", "also", "plus", "additionally", "furthermore"
+    # Explicit multi-step connectors (user is describing a sequence)
+    sequence_phrases = [
+        "and then", "after that", "once that's done", "next step",
+        "first ", "second ", "third ", "finally ",
+        "step 1", "step 2", "additionally", "furthermore",
     ]
+    sequence_count = sum(1 for p in sequence_phrases if p in prompt_lower)
     
-    # Count multi-step indicators
-    keyword_count = sum(1 for kw in multi_step_keywords if kw in prompt_lower)
-    
-    # If 2+ keywords found, it's likely complex
-    if keyword_count >= 2:
+    # Require at least 2 explicit sequence indicators
+    if sequence_count >= 2:
         return True
     
-    # Check for conjunctions suggesting multiple parts
-    conjunctions = [" and ", " then ", " also ", " plus "]
-    if any(c in prompt_lower for c in conjunctions):
-        return True
-    
-    # Check for implementation/build language
-    impl_keywords = ["implement", "build", "create", "add feature", "refactor"]
-    if any(kw in prompt_lower for kw in impl_keywords):
+    # Numbered list pattern ("1. do X  2. do Y")
+    import re
+    numbered_steps = re.findall(r'\b\d+[.)\s]', prompt)
+    if len(numbered_steps) >= 3:
         return True
     
     return False
@@ -285,6 +346,7 @@ class AgentStreamRequest(BaseModel):
     local_llm: Optional[Dict[str, Any]] = None  # {url, model, context_length}
     ide_metadata: Optional[Dict[str, Any]] = None  # {os, cursor_line, active_language, open_files, selection}
     workspace_layout: Optional[str] = None  # file tree snapshot from client
+    conversation_id: Optional[str] = None  # Persistent conversation ID for cross-request context
 
 
 class ToolResultRequest(BaseModel):
@@ -1002,13 +1064,17 @@ async def agent_stream(
     is_weak = provider_key in _WEAK_PROVIDERS or any(w in model_name.lower() for w in _WEAK_MODELS)
     agent_temperature = 0.5 if is_weak else 0.7
 
+    conversation_id = request_body.conversation_id
+
     logger.info(
         f"Agent stream: session={session.id} user={user_id} "
+        f"conversation={conversation_id or 'new'} "
         f"provider={provider_key} model={model_name} "
         f"workspace={request_body.workspace_root}"
     )
 
     async def generate():
+        nonlocal conversation_id
         try:
             system_prompt = _build_system_prompt(
                 request_body.workspace_root,
@@ -1016,39 +1082,66 @@ async def agent_stream(
                 ide_metadata=request_body.ide_metadata,
                 workspace_layout=request_body.workspace_layout,
             )
-            messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
 
-            if request_body.context:
-                for ctx in request_body.context:
-                    if ctx.get("role") in ("user", "assistant"):
-                        messages.append({"role": ctx["role"], "content": ctx.get("content", "")})
+            # ── Conversation persistence: load previous context or start fresh ──
+            _cleanup_conversations()
+            convo = None
+            if conversation_id and conversation_id in _conversations:
+                convo = _conversations[conversation_id]
+                if convo.expired or convo.user_id != user_id:
+                    convo = None
 
-            # Auto-inject relevant memories at conversation start for context continuity
-            if not request_body.context or len(request_body.context) < 3:
-                # Only auto-inject on new conversations (little to no history)
-                memory_injection = await _auto_inject_memories(
-                    workspace_root=request_body.workspace_root,
-                    prompt=request_body.prompt,
-                    user_id=user_id,
-                    auth_token=auth_token
-                )
-                if memory_injection:
-                    messages.append({"role": "system", "content": memory_injection})
-
-            messages.append({"role": "user", "content": request_body.prompt})
+            if convo:
+                # RESUME conversation — load full tool context from previous turns
+                convo.touch()
+                messages = list(convo.messages)
+                # Always update system prompt (IDE state may have changed)
+                if messages and messages[0].get("role") == "system":
+                    messages[0] = {"role": "system", "content": system_prompt}
+                else:
+                    messages.insert(0, {"role": "system", "content": system_prompt})
+                messages.append({"role": "user", "content": request_body.prompt})
+                # Compress old messages to fit context window
+                if len(messages) > 60:
+                    _compress_old_messages(messages, aggressive=True)
+                elif len(messages) > 30:
+                    _compress_old_messages(messages, aggressive=False)
+                logger.info(f"Resumed conversation {conversation_id}: {len(messages)} messages")
+            else:
+                # NEW conversation
+                if not conversation_id:
+                    conversation_id = str(uuid.uuid4())[:12]
+                messages: List[Dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+                if request_body.context:
+                    for ctx in request_body.context:
+                        if ctx.get("role") in ("user", "assistant"):
+                            messages.append({"role": ctx["role"], "content": ctx.get("content", "")})
+                # Auto-inject relevant memories at conversation start
+                if not request_body.context or len(request_body.context) < 3:
+                    memory_injection = await _auto_inject_memories(
+                        workspace_root=request_body.workspace_root,
+                        prompt=request_body.prompt,
+                        user_id=user_id,
+                        auth_token=auth_token
+                    )
+                    if memory_injection:
+                        messages.append({"role": "system", "content": memory_injection})
+                messages.append({"role": "user", "content": request_body.prompt})
+                logger.info(f"New conversation {conversation_id}: {len(messages)} messages")
 
             # Detect if task requires a plan (complex, multi-step, ambiguous)
             requires_plan = _is_complex_task(request_body.prompt)
             if requires_plan:
-                # Force plan creation by modifying the prompt
-                plan_instruction = "\n\nFIRST: Create a detailed action plan using the todo_list tool. Break this task into specific steps. Mark all steps as 'pending'. Then execute the steps one by one, marking each as 'in_progress' when starting and 'completed' when done.\n"
+                # Create plan once, then immediately start real work — do NOT loop back to todo_list
+                plan_instruction = "\n\nThis is a multi-step task. Call todo_list ONCE to outline your plan, then immediately begin executing step 1 using real tools (run_command, file_read, file_edit, etc.). Do NOT call todo_list again — focus on doing the actual work.\n"
                 request_body.prompt = request_body.prompt + plan_instruction
 
             tools = _select_tools(request_body.prompt)
             tool_names = [t["function"]["name"] for t in tools]
             logger.info(f"Tools selected ({len(tools)}): {tool_names}")
             logger.info(f"Prompt ({len(request_body.prompt)} chars): {request_body.prompt[:200]}")
-            max_loops = request_body.max_loops
+            max_loops = max(request_body.max_loops, 1)
+            logger.info(f"Max loops: {max_loops} (client sent: {request_body.max_loops})")
             total_tool_calls = 0
             total_tokens = 0
             loops = 0
@@ -1070,12 +1163,7 @@ async def agent_stream(
                 loop_fallback_chain = []
 
                 # Force tool use on first loop so agent investigates before talking
-                # If task requires plan, force todo_list creation on first loop
-                if requires_plan and loops == 1 and not todo_list_created:
-                    # Force todo_list tool on first loop for complex tasks
-                    loop_tool_choice = {"type": "function", "function": {"name": "todo_list"}}
-                else:
-                    loop_tool_choice = "required" if loops == 1 and tools else "auto"
+                loop_tool_choice = "required" if loops == 1 and tools else "auto"
 
                 use_ollama_proxy = (provider_key == "ollama" and request_body.local_llm is not None)
                 llm_done = False
@@ -1312,7 +1400,8 @@ async def agent_stream(
                                     # Send terminal_only_mode event to client
                                     yield f"event: terminal_only_mode\ndata: {json.dumps({'session_id': session.id, 'terminal_session_id': result_json.get('terminal_session_id')})}\n\n"
                                     # Enter terminal-only REPL loop
-                                    yield f"event: text\ndata: {json.dumps({'content': '\\n=== Terminal-Only Mode Active ===\\nAgent is now communicating via terminal only. Type `exit` in terminal to return to chat mode.\\n'})}\n\n"
+                                    _tom_msg = '\n=== Terminal-Only Mode Active ===\nAgent is now communicating via terminal only. Type `exit` in terminal to return to chat mode.\n'
+                                    yield f"event: text\ndata: {json.dumps({'content': _tom_msg})}\n\n"
                                     
                                     # Terminal-only REPL loop
                                     while session.terminal_only_mode:
@@ -1330,7 +1419,8 @@ async def agent_stream(
                                             
                                             # Check for exit command
                                             if terminal_input.strip().lower() in ['exit', 'quit']:
-                                                yield f"event: text\ndata: {json.dumps({'content': '\\nExiting terminal-only mode. Returning to chat mode.\\n'})}\n\n"
+                                                _exit_msg = '\nExiting terminal-only mode. Returning to chat mode.\n'
+                                                yield f"event: text\ndata: {json.dumps({'content': _exit_msg})}\n\n"
                                                 session.terminal_only_mode = False
                                                 session.terminal_session_id = None
                                                 break
@@ -1397,7 +1487,7 @@ async def agent_stream(
                                                 async with httpx.AsyncClient() as client:
                                                     await client.post(
                                                         f"{request_body.api_url or 'https://dev-swat.com'}/api/v1/ide/terminal-send",
-                                                        json={"session_id": session.terminal_session_id, "input": "\\n"},
+                                                        json={"session_id": session.terminal_session_id, "input": "\n"},
                                                         headers={"authorization": f"Bearer {auth_token}"},
                                                         timeout=5.0
                                                     )
@@ -1410,7 +1500,7 @@ async def agent_stream(
                                                 async with httpx.AsyncClient() as client:
                                                     await client.post(
                                                         f"{request_body.api_url or 'https://dev-swat.com'}/api/v1/ide/terminal-send",
-                                                        json={"session_id": session.terminal_session_id, "input": "\\n> "},
+                                                        json={"session_id": session.terminal_session_id, "input": "\n> "},
                                                         headers={"authorization": f"Bearer {auth_token}"},
                                                         timeout=5.0
                                                     )
@@ -1422,7 +1512,8 @@ async def agent_stream(
                                             break
                                     
                                     # After loop exits, continue with normal flow
-                                    yield f"event: text\ndata: {json.dumps({'content': '\\n=== Returned to Chat Mode ===\\n'})}\n\n"
+                                    _return_msg = '\n=== Returned to Chat Mode ===\n'
+                                    yield f"event: text\ndata: {json.dumps({'content': _return_msg})}\n\n"
                                     
                             except Exception as e:
                                 logger.error(f"Error handling terminal_only_mode: {e}")
@@ -1496,8 +1587,16 @@ async def agent_stream(
                 if loops < max_loops:
                     yield f"event: thinking\ndata: {json.dumps({'message': f'Analyzing results... (loop {loops}, {total_tool_calls} tools used)'})}\n\n"
 
-            # ── Done ──
-            yield f"event: stats\ndata: {json.dumps({'loops': loops, 'tool_calls': total_tool_calls, 'tokens': total_tokens, 'provider': last_provider, 'model': last_model, 'fallback_chain': fallback_chain})}\n\n"
+            # ── Done: save conversation state for future requests ──
+            convo_state = _conversations.get(conversation_id)
+            if not convo_state:
+                convo_state = ConversationState(user_id, request_body.workspace_root)
+                _conversations[conversation_id] = convo_state
+            convo_state.messages = messages
+            convo_state.touch()
+            save_conversations_to_disk()
+
+            yield f"event: stats\ndata: {json.dumps({'loops': loops, 'tool_calls': total_tool_calls, 'tokens': total_tokens, 'provider': last_provider, 'model': last_model, 'fallback_chain': fallback_chain, 'conversation_id': conversation_id})}\n\n"
             yield f"event: done\ndata: {json.dumps({})}\n\n"
 
         except Exception as e:
