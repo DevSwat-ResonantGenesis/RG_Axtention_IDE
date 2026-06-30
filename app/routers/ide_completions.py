@@ -10,7 +10,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from ..llm_client import call_llm_streaming, fetch_user_byok_keys
@@ -27,6 +27,7 @@ class IDECompletionRequest(BaseModel):
     preferred_provider: str = ""
     temperature: float = 0.7
     max_tokens: int = 16384
+    stream: bool = True
 
 
 @router.post("/completions")
@@ -34,7 +35,7 @@ async def ide_completions(
     request_body: IDECompletionRequest,
     request: Request,
 ):
-    """Single-turn streaming LLM call. Returns SSE with chunk/tool_calls/done/error events."""
+    """Single-turn LLM call. Returns SSE (stream=true) or OpenAI-format JSON (stream=false)."""
     auth_header = request.headers.get("authorization", "")
     auth_token = auth_header.replace("Bearer ", "") if auth_header.startswith("Bearer ") else ""
     user_id = request.headers.get("x-user-id") or auth_token[:20] or ""
@@ -43,6 +44,54 @@ async def ide_completions(
 
     user_keys = await fetch_user_byok_keys(user_id, auth_token)
 
+    # ── Non-streaming path: accumulate and return OpenAI-format JSON ──
+    if not request_body.stream:
+        content = ""
+        tool_calls = []
+        usage = {}
+        provider = ""
+        model = ""
+        try:
+            async for chunk in call_llm_streaming(
+                messages=request_body.messages,
+                preferred_provider=request_body.preferred_provider,
+                preferred_model=request_body.model,
+                user_keys=user_keys,
+                tools=request_body.tools,
+                temperature=request_body.temperature,
+                max_tokens=request_body.max_tokens,
+            ):
+                if chunk.event == "chunk":
+                    content += chunk.content or ""
+                elif chunk.event == "tool_calls":
+                    tool_calls = chunk.tool_calls or []
+                elif chunk.event == "done":
+                    usage = chunk.usage or {}
+                    provider = chunk.provider or ""
+                    model = chunk.model or ""
+                elif chunk.event == "error":
+                    return JSONResponse(
+                        status_code=500,
+                        content={"error": chunk.error},
+                    )
+        except Exception as e:
+            logger.error(f"IDE completions error: {e}", exc_info=True)
+            return JSONResponse(
+                status_code=500,
+                content={"error": str(e)},
+            )
+
+        message: Dict[str, Any] = {"role": "assistant", "content": content or None}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+        return JSONResponse(content={
+            "choices": [{"message": message}],
+            "usage": usage,
+            "provider": provider,
+            "model": model,
+        })
+
+    # ── Streaming path: SSE events ──
     async def generate():
         try:
             async for chunk in call_llm_streaming(
