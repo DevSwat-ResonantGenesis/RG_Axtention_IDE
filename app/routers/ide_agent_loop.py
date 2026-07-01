@@ -1576,7 +1576,14 @@ async def agent_stream(
                         if m.get("role") == "user":
                             user_msg = m
                             break
-                    recent = messages[-45:]
+                    cut = len(messages) - 45
+                    # Don't split an assistant(tool_calls)/tool pair — a "tool"
+                    # message at the cut point means its matching assistant
+                    # tool_use got dropped, leaving an orphaned tool_result
+                    # that Anthropic (and other providers) reject with a 400.
+                    while 0 < cut < len(messages) and messages[cut].get("role") == "tool":
+                        cut -= 1
+                    recent = messages[cut:]
                     messages = [system] + recent
                     # Re-inject original user request right after system if it was dropped
                     if user_msg and user_msg not in recent:
