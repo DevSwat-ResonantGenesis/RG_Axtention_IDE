@@ -1229,7 +1229,7 @@ async def agent_stream(
                                             import httpx
                                             async with httpx.AsyncClient() as client:
                                                 await client.post(
-                                                    f"{request_body.api_url or 'https://dev-swat.com'}/api/v1/ide/terminal-send",
+                                                    f"{request_body.api_url or 'https://resonant.dev-swat.com'}/api/v1/ide/terminal-send",
                                                     json={"session_id": session.terminal_session_id, "input": chunk.content},
                                                     headers={"authorization": f"Bearer {auth_token}"},
                                                     timeout=5.0
@@ -1451,7 +1451,7 @@ async def agent_stream(
                                                             import httpx
                                                             async with httpx.AsyncClient() as client:
                                                                 await client.post(
-                                                                    f"{request_body.api_url or 'https://dev-swat.com'}/api/v1/ide/terminal-send",
+                                                                    f"{request_body.api_url or 'https://resonant.dev-swat.com'}/api/v1/ide/terminal-send",
                                                                     json={"session_id": session.terminal_session_id, "input": chunk.content},
                                                                     headers={"authorization": f"Bearer {auth_token}"},
                                                                     timeout=5.0
@@ -1486,7 +1486,7 @@ async def agent_stream(
                                                 import httpx
                                                 async with httpx.AsyncClient() as client:
                                                     await client.post(
-                                                        f"{request_body.api_url or 'https://dev-swat.com'}/api/v1/ide/terminal-send",
+                                                        f"{request_body.api_url or 'https://resonant.dev-swat.com'}/api/v1/ide/terminal-send",
                                                         json={"session_id": session.terminal_session_id, "input": "\n"},
                                                         headers={"authorization": f"Bearer {auth_token}"},
                                                         timeout=5.0
@@ -1499,7 +1499,7 @@ async def agent_stream(
                                                 import httpx
                                                 async with httpx.AsyncClient() as client:
                                                     await client.post(
-                                                        f"{request_body.api_url or 'https://dev-swat.com'}/api/v1/ide/terminal-send",
+                                                        f"{request_body.api_url or 'https://resonant.dev-swat.com'}/api/v1/ide/terminal-send",
                                                         json={"session_id": session.terminal_session_id, "input": "\n> "},
                                                         headers={"authorization": f"Bearer {auth_token}"},
                                                         timeout=5.0
