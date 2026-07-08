@@ -110,6 +110,6 @@
 #
 # ═══════════════════════════════════════════════════════════════════
 # DEPLOY:
-# rsync -avz RG_Axtention_IDE/ deploy@resonant.dev-swat.com:/home/deploy/RG_Axtention_IDE/
-# ssh deploy@resonant.dev-swat.com "cd /home/deploy && docker-compose -f docker-compose.unified.yml up -d --build ide_service"
+# rsync -avz RG_Axtention_IDE/ deploy@dev-swat.com:/home/deploy/RG_Axtention_IDE/
+# ssh deploy@dev-swat.com "cd /home/deploy && docker-compose -f docker-compose.unified.yml up -d --build ide_service"
 # ═══════════════════════════════════════════════════════════════════

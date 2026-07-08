@@ -1,6 +1,6 @@
 # RG_Axtention_IDE
 
-**Server-side agentic orchestration for Resonant IDE** by [Resonant Genesis](https://resonant.dev-swat.com).
+**Server-side agentic orchestration for Resonant IDE** by [Resonant Genesis](https://dev-swat.com).
 
 ## Overview
 
